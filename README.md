@@ -1,0 +1,140 @@
+# litem8
+
+A simple SQLite migration tool written in Zig.
+
+## Features
+
+- **Up migrations only** — No down migrations, keeping things simple
+- **Gap detection** — Prevents inserting new migrations between already-run ones
+- **Duplicate detection** — Fails if two migration files have the same number
+- **Transaction per migration** — Each migration runs in its own transaction
+- **Custom table name** — Override the default `schema_migrations` table name
+
+## Requirements
+
+- [Zig 0.15.2](https://ziglang.org/download/) or later
+
+## Building
+
+```bash
+# Debug build
+zig build
+
+# Release build
+zig build -Doptimize=ReleaseSafe
+
+# Run tests
+zig build test
+```
+
+The binary will be at `zig-out/bin/litem8`.
+
+## Usage
+
+```bash
+# Run all pending migrations
+litem8 up --db <database.db> --migrations <migrations_dir>
+
+# Check migration status
+litem8 status --db <database.db> --migrations <migrations_dir>
+
+# Use a custom migrations table name
+litem8 up --db <database.db> --migrations <migrations_dir> --table my_migrations
+```
+
+### Options
+
+| Option | Required | Description |
+|--------|----------|-------------|
+| `--db <path>` | Yes | Path to SQLite database file (created if doesn't exist) |
+| `--migrations <path>` | Yes | Path to directory containing migration files |
+| `--table <name>` | No | Name of schema migrations table (default: `schema_migrations`) |
+| `--help` | No | Show help message |
+
+### Migration File Format
+
+Migration files must follow this naming convention:
+
+```
+<number>_<name>.sql
+```
+
+Examples:
+- `001_create_users.sql`
+- `002_add_posts.sql`
+- `1_init.sql`
+- `10_add_indexes.sql`
+
+**Rules:**
+- The number can be zero-padded (`001`) or not (`1`) — they're treated as equivalent
+- The number must be followed by an underscore
+- There must be a descriptive name after the underscore
+- The file must end with `.sql`
+- Files that don't match this pattern are ignored
+
+### Example
+
+Create a migrations directory:
+
+```bash
+mkdir migrations
+```
+
+Create your first migration:
+
+```sql
+-- migrations/001_create_users.sql
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+Run migrations:
+
+```bash
+litem8 up --db myapp.db --migrations ./migrations
+```
+
+Output:
+```
+Running 1 pending migration(s)...
+
+  Running: 001_create_users.sql... done
+
+Successfully ran 1 migration(s).
+```
+
+Check status:
+
+```bash
+litem8 status --db myapp.db --migrations ./migrations
+```
+
+Output:
+```
+Run migrations:
+
+DATE				NAME
+----				----
+2025-01-15 10:30:45	001_create_users.sql
+
+Total: 1 migration(s)
+```
+
+## How It Works
+
+1. **Schema tracking**: Migrations are tracked in a `schema_migrations` table with columns:
+   - `id` — Auto-incrementing primary key
+   - `name` — Full filename of the migration
+   - `run_at` — Timestamp when the migration was run
+
+2. **Gap detection**: If migrations 1 and 3 have been run, adding a new migration 2 will fail. New migrations must have numbers greater than all previously run migrations.
+
+3. **Transactions**: Each migration runs in its own transaction. If a migration fails, it's rolled back and subsequent migrations are not run.
+
+## License
+
+MIT
