@@ -2,3 +2,7 @@
 *.db
 zig-out/
 
+# Nix
+result
+result-*
+

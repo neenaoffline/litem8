@@ -21,12 +21,34 @@ migrations.
 ## Requirements
 
 - [Zig 0.15.2](https://ziglang.org/download/) or later
+- Or [Nix](https://nixos.org/) with flakes enabled
 
-## Building
+## Installation
+
+### With Nix (recommended)
 
 ```bash
-# Debug build
+# Run directly without installing
+nix run github:neenaoffline/litem8 -- --help
+
+# Or install to your profile
+nix profile install github:neenaoffline/litem8
+```
+
+### Building from source
+
+```bash
+# Clone the repository
+git clone https://github.com/neenaoffline/litem8.git
+cd litem8
+
+# With Nix
+nix build
+./result/bin/litem8 --help
+
+# Or with Zig directly
 zig build
+./zig-out/bin/litem8 --help
 
 # Release build
 zig build -Doptimize=ReleaseSafe
@@ -35,7 +57,16 @@ zig build -Doptimize=ReleaseSafe
 zig build test
 ```
 
-The binary will be at `zig-out/bin/litem8`.
+## Development
+
+```bash
+# Enter dev shell with zig and sqlite
+nix develop
+
+# Build and test
+zig build
+zig build test
+```
 
 ## Usage
 
