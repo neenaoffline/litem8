@@ -47,29 +47,6 @@
               };
             };
 
-            # Static musl builds for minimal container images
-            litem8-static-x86_64 = env.package {
-              src = lib.cleanSource ./.;
-              nativeBuildInputs = [ ];
-              buildInputs = [ ];
-              zigBuildFlags = [ "-Dtarget=x86_64-linux-musl" ];
-              meta = {
-                description = "SQLite migration tool (static x86_64 build)";
-                mainProgram = "litem8";
-              };
-            };
-
-            litem8-static-aarch64 = env.package {
-              src = lib.cleanSource ./.;
-              nativeBuildInputs = [ ];
-              buildInputs = [ ];
-              zigBuildFlags = [ "-Dtarget=aarch64-linux-musl" ];
-              meta = {
-                description = "SQLite migration tool (static aarch64 build)";
-                mainProgram = "litem8";
-              };
-            };
-
             default = self'.packages.litem8;
           };
 
