@@ -1,0 +1,128 @@
+# litem8
+
+> A simple SQLite migration tool written in Zig.
+
+litem8 is a command-line tool for running SQLite database migrations. It is designed to be simple and straightforward, supporting only "up" migrations (no rollbacks).
+
+## Installation
+
+```bash
+# With Nix
+nix run github:neenaoffline/litem8 -- --help
+
+# Or build from source with Zig 0.15.2+
+zig build -Doptimize=ReleaseSafe
+```
+
+## Commands
+
+### Run migrations
+
+```bash
+litem8 up --db <database.db> --migrations <migrations_dir> [--table <table_name>]
+```
+
+### Check migration status
+
+```bash
+litem8 status --db <database.db> --migrations <migrations_dir> [--table <table_name>]
+```
+
+## Options
+
+- `--db <path>` (required): Path to SQLite database file. Created if it doesn't exist.
+- `--migrations <path>` (required): Path to directory containing migration files.
+- `--table <name>` (optional): Name of schema migrations table. Default: `schema_migrations`.
+- `--help`: Show help message.
+
+## Migration File Format
+
+Migration files must follow this naming convention:
+
+```
+<number>_<name>.sql
+```
+
+Rules:
+- Use zero-padded numbers (e.g., `001`, `002`) so files sort correctly in editors and file managers
+- The number must be followed by an underscore
+- There must be a descriptive name after the underscore
+- The file must end with `.sql`
+- Files that don't match this pattern are ignored
+
+Examples:
+- `001_create_users.sql`
+- `002_add_posts.sql`
+- `010_add_indexes.sql`
+
+## How It Works
+
+1. **Schema tracking**: Migrations are tracked in a `schema_migrations` table with columns:
+   - `id`: Auto-incrementing primary key
+   - `name`: Full filename of the migration
+   - `run_at`: Timestamp when the migration was run
+
+2. **Gap detection**: If migrations 001 and 003 have been run, adding a new migration 002 will fail. New migrations must have numbers greater than all previously run migrations.
+
+3. **Duplicate detection**: If two migration files have the same number, the tool will fail with an error.
+
+4. **Transactions**: Each migration runs in its own transaction. If a migration fails, it is rolled back and subsequent migrations are not run.
+
+## Example Usage
+
+Create a migrations directory:
+
+```bash
+mkdir migrations
+```
+
+Create migration files:
+
+```sql
+-- migrations/001_create_users.sql
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT NOT NULL UNIQUE,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+```sql
+-- migrations/002_create_posts.sql
+CREATE TABLE posts (
+    id INTEGER PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+Run migrations:
+
+```bash
+litem8 up --db myapp.db --migrations ./migrations
+```
+
+Check status:
+
+```bash
+litem8 status --db myapp.db --migrations ./migrations
+```
+
+## Key Behaviors
+
+- The database file is created automatically if it doesn't exist
+- Empty migration files are allowed and will be recorded as run
+- Migration SQL can contain multiple statements
+- The tool exits with code 1 on any error
+
+## Error Conditions
+
+The tool will fail if:
+- The migrations directory doesn't exist
+- Two migration files have the same number
+- A new migration has a number less than or equal to an already-run migration (gap detection)
+- A migration SQL statement fails to execute
+- The database cannot be opened or created
