@@ -37,8 +37,6 @@ nix profile install github:neenaoffline/litem8
 
 ### With Docker
 
-The Docker image is a minimal `scratch`-based container (~few MB) with a statically-linked musl binary. Multi-arch images are available for both `linux/amd64` and `linux/arm64`.
-
 ```bash
 # Run directly (pulls from GitHub Container Registry)
 docker run --rm -v $(pwd):/data ghcr.io/neenaoffline/litem8 \
