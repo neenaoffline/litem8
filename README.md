@@ -35,6 +35,62 @@ nix run github:neenaoffline/litem8 -- --help
 nix profile install github:neenaoffline/litem8
 ```
 
+### With Docker
+
+The Docker image is a minimal `scratch`-based container (~few MB) with a statically-linked musl binary. Multi-arch images are available for both `linux/amd64` and `linux/arm64`.
+
+```bash
+# Run directly (pulls from GitHub Container Registry)
+docker run --rm -v $(pwd):/data ghcr.io/neenaoffline/litem8 \
+  up --db /data/myapp.db --migrations /data/migrations
+
+# Check status
+docker run --rm -v $(pwd):/data ghcr.io/neenaoffline/litem8 \
+  status --db /data/myapp.db --migrations /data/migrations
+```
+
+### With Docker Compose
+
+Add to your `docker-compose.yml`:
+
+```yaml
+services:
+  migrate:
+    image: ghcr.io/neenaoffline/litem8
+    restart: "no"
+    volumes:
+      - ./data:/data
+      - ./migrations:/migrations
+    command: up --db /data/myapp.db --migrations /migrations
+```
+
+Run migrations:
+
+```bash
+docker compose run --rm migrate
+```
+
+Or as a one-off service that runs before your app:
+
+```yaml
+services:
+  app:
+    image: your-app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    volumes:
+      - ./data:/data
+
+  migrate:
+    image: ghcr.io/neenaoffline/litem8
+    restart: "no"
+    volumes:
+      - ./data:/data
+      - ./migrations:/migrations
+    command: up --db /data/app.db --migrations /migrations
+```
+
 ### Building from source
 
 ```bash
