@@ -231,3 +231,8 @@ Total: 1 migration(s)
 ## License
 
 MIT
+
+---
+
+> [!NOTE]
+> The name "litem8" comes from "SQLite Migration". While the typical numeronym would be "m9n" (m-i-g-r-a-t-i-o-n), we use "m8" to also play on the "ate" in "migrate".
