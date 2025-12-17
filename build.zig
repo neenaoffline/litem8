@@ -61,6 +61,7 @@ pub fn build(b: *std.Build) void {
     const sqlite = b.dependency("sqlite", .{
         .target = target,
         .optimize = optimize,
+        .fts5 = true,
     });
 
     const exe = b.addExecutable(.{

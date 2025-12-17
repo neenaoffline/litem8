@@ -17,6 +17,7 @@ migrations.
 - **Duplicate detection** — Fails if two migration files have the same number
 - **Transaction per migration** — Each migration runs in its own transaction
 - **Custom table name** — Override the default `schema_migrations` table name
+- **FTS5 enabled** — Full-text search support is compiled in
 
 ## Requirements
 
