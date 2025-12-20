@@ -629,3 +629,162 @@ test "e2e: custom --table name" {
     try std.testing.expectEqual(@as(usize, 1), migrations.len);
     try std.testing.expectEqualStrings("001_create_users.sql", migrations[0]);
 }
+
+test "e2e: up - hash verification detects modified migration" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    // Create and run a migration
+    try tmp.writeMigration("001_create_users.sql",
+        \\CREATE TABLE users (id INTEGER PRIMARY KEY);
+    );
+
+    var result1 = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result1.deinit();
+    try std.testing.expectEqual(@as(?u8, 0), result1.exitCode());
+
+    // Modify the migration file
+    try tmp.writeMigration("001_create_users.sql",
+        \\CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+    );
+
+    // Try to run again - should fail due to hash mismatch
+    var result2 = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result2.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 1), result2.exitCode());
+    try std.testing.expect(containsString(result2.stderr, "modified") or
+        containsString(result2.stderr, "changed") or
+        containsString(result2.stderr, "hash"));
+}
+
+test "e2e: status - hash verification detects modified migration" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    // Create and run a migration
+    try tmp.writeMigration("001_create_users.sql",
+        \\CREATE TABLE users (id INTEGER PRIMARY KEY);
+    );
+
+    var result1 = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result1.deinit();
+    try std.testing.expectEqual(@as(?u8, 0), result1.exitCode());
+
+    // Modify the migration file
+    try tmp.writeMigration("001_create_users.sql",
+        \\CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+    );
+
+    // Check status - should fail due to hash mismatch
+    var result2 = try runLitem8(allocator, &.{
+        "status",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result2.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 1), result2.exitCode());
+    try std.testing.expect(containsString(result2.stderr, "modified") or
+        containsString(result2.stderr, "changed") or
+        containsString(result2.stderr, "hash"));
+}
+
+test "e2e: up - hash verification detects missing migration file" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    // Create and run two migrations
+    try tmp.writeMigration("001_create_users.sql",
+        \\CREATE TABLE users (id INTEGER PRIMARY KEY);
+    );
+    try tmp.writeMigration("002_add_posts.sql",
+        \\CREATE TABLE posts (id INTEGER PRIMARY KEY);
+    );
+
+    var result1 = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result1.deinit();
+    try std.testing.expectEqual(@as(?u8, 0), result1.exitCode());
+
+    // Delete the first migration file
+    const migrations_dir = try tmp.dir.openDir("migrations", .{});
+    var dir = migrations_dir;
+    defer dir.close();
+    try dir.deleteFile("001_create_users.sql");
+
+    // Try to run again - should fail due to missing file
+    var result2 = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result2.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 1), result2.exitCode());
+    try std.testing.expect(containsString(result2.stderr, "missing") or
+        containsString(result2.stderr, "no longer exists"));
+}
+
+test "e2e: hash stored in migrations table" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    try tmp.writeMigration("001_create_users.sql",
+        \\CREATE TABLE users (id INTEGER PRIMARY KEY);
+    );
+
+    var result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(?u8, 0), result.exitCode());
+
+    // Verify hash is stored in the database
+    var db = try openDb(allocator, tmp.db_path);
+    defer db.deinit();
+
+    var stmt = db.prepareDynamicWithDiags("SELECT hash FROM schema_migrations WHERE name = '001_create_users.sql'", .{}) catch unreachable;
+    defer stmt.deinit();
+
+    const row = (stmt.oneAlloc(struct { hash: ?[]const u8 }, allocator, .{}, .{}) catch unreachable).?;
+    defer if (row.hash) |h| allocator.free(h);
+
+    try std.testing.expect(row.hash != null);
+    try std.testing.expectEqual(@as(usize, 64), row.hash.?.len); // SHA256 = 64 hex chars
+}

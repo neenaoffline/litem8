@@ -33,6 +33,7 @@ const RunMigration = struct {
     name: []const u8,
     number: u32,
     run_at: []const u8,
+    hash: ?[]const u8,
 };
 
 const MigrationError = error{
@@ -42,7 +43,82 @@ const MigrationError = error{
     MigrationDirectoryNotFound,
     DatabaseError,
     SqlExecutionError,
+    HashMismatch,
 };
+
+// ============================================================================
+// Hash Utilities
+// ============================================================================
+
+/// Compute SHA256 hash of file contents and return as hex string
+fn computeFileHash(allocator: Allocator, file_path: []const u8) ![]const u8 {
+    const contents = std.fs.cwd().readFileAlloc(
+        allocator,
+        file_path,
+        10 * 1024 * 1024, // 10MB max
+    ) catch {
+        return MigrationError.SqlExecutionError;
+    };
+    defer allocator.free(contents);
+
+    var hash: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(contents, &hash, .{});
+
+    // Convert to hex string
+    var hex_buf: [64]u8 = undefined;
+    for (hash, 0..) |byte, i| {
+        const hex_chars = "0123456789abcdef";
+        hex_buf[i * 2] = hex_chars[byte >> 4];
+        hex_buf[i * 2 + 1] = hex_chars[byte & 0x0f];
+    }
+
+    return try allocator.dupe(u8, &hex_buf);
+}
+
+/// Verify that all run migrations have matching hashes with current files
+/// Returns error.HashMismatch if any hash doesn't match
+fn verifyMigrationHashes(allocator: Allocator, migrations: []const Migration, run_migrations: []const RunMigration) !void {
+    // Build a map of name -> migration for quick lookup
+    var migration_map = std.StringHashMap(Migration).init(allocator);
+    defer migration_map.deinit();
+
+    for (migrations) |m| {
+        try migration_map.put(m.name, m);
+    }
+
+    // Check each run migration
+    for (run_migrations) |rm| {
+        // Skip if no hash stored (legacy migration)
+        const stored_hash = rm.hash orelse continue;
+
+        // Find corresponding migration file
+        const migration = migration_map.get(rm.name) orelse {
+            std.debug.print(
+                "Error: Migration file missing!\n" ++
+                    "Migration '{s}' was previously run but the file no longer exists.\n",
+                .{rm.name},
+            );
+            return MigrationError.HashMismatch;
+        };
+
+        // Compute current hash
+        const current_hash = try computeFileHash(allocator, migration.path);
+        defer allocator.free(current_hash);
+
+        // Compare hashes
+        if (!std.mem.eql(u8, stored_hash, current_hash)) {
+            std.debug.print(
+                "Error: Migration file has been modified!\n" ++
+                    "Migration '{s}' has changed since it was run.\n" ++
+                    "  Expected hash: {s}\n" ++
+                    "  Current hash:  {s}\n" ++
+                    "Modifying already-run migrations can cause inconsistencies.\n",
+                .{ rm.name, stored_hash, current_hash },
+            );
+            return MigrationError.HashMismatch;
+        }
+    }
+}
 
 // ============================================================================
 // CLI Argument Parsing
@@ -271,7 +347,7 @@ fn createMigrationsTable(db: *sqlite.Db, table_name: []const u8) !void {
     // Build CREATE TABLE statement
     const create_sql = std.fmt.allocPrint(
         std.heap.page_allocator,
-        "CREATE TABLE IF NOT EXISTS {s} (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, run_at TEXT NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS {s} (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, run_at TEXT NOT NULL, hash TEXT)",
         .{table_name},
     ) catch return MigrationError.DatabaseError;
     defer std.heap.page_allocator.free(create_sql);
@@ -279,17 +355,29 @@ fn createMigrationsTable(db: *sqlite.Db, table_name: []const u8) !void {
     db.execDynamic(create_sql, .{}, .{}) catch {
         return MigrationError.DatabaseError;
     };
+
+    // Add hash column if it doesn't exist (for existing databases)
+    const alter_sql = std.fmt.allocPrint(
+        std.heap.page_allocator,
+        "ALTER TABLE {s} ADD COLUMN hash TEXT",
+        .{table_name},
+    ) catch return MigrationError.DatabaseError;
+    defer std.heap.page_allocator.free(alter_sql);
+
+    // Ignore error if column already exists
+    db.execDynamic(alter_sql, .{}, .{}) catch {};
 }
 
 const MigrationRow = struct {
     name: []const u8,
     run_at: []const u8,
+    hash: ?[]const u8,
 };
 
 fn getRunMigrations(allocator: Allocator, db: *sqlite.Db, table_name: []const u8) ![]RunMigration {
     const query = std.fmt.allocPrint(
         allocator,
-        "SELECT name, run_at FROM {s} ORDER BY id",
+        "SELECT name, run_at, hash FROM {s} ORDER BY id",
         .{table_name},
     ) catch return MigrationError.DatabaseError;
     defer allocator.free(query);
@@ -315,6 +403,7 @@ fn getRunMigrations(allocator: Allocator, db: *sqlite.Db, table_name: []const u8
         const r = row.?;
         const name = r.name;
         const run_at = r.run_at;
+        const hash = r.hash;
 
         // Parse migration number from name
         const number = parseMigrationNumber(name) catch {
@@ -326,13 +415,14 @@ fn getRunMigrations(allocator: Allocator, db: *sqlite.Db, table_name: []const u8
             .name = try allocator.dupe(u8, name),
             .number = number,
             .run_at = try allocator.dupe(u8, run_at),
+            .hash = if (hash) |h| try allocator.dupe(u8, h) else null,
         });
     }
 
     return results.toOwnedSlice(allocator);
 }
 
-fn executeMigration(db: *sqlite.Db, migration: Migration, table_name: []const u8) !void {
+fn executeMigration(allocator: Allocator, db: *sqlite.Db, migration: Migration, table_name: []const u8) !void {
     // Read migration file
     const raw_sql = std.fs.cwd().readFileAlloc(
         std.heap.page_allocator,
@@ -342,6 +432,10 @@ fn executeMigration(db: *sqlite.Db, migration: Migration, table_name: []const u8
         return MigrationError.SqlExecutionError;
     };
     defer std.heap.page_allocator.free(raw_sql);
+
+    // Compute hash of the migration file
+    const hash = try computeFileHash(allocator, migration.path);
+    defer allocator.free(hash);
 
     // Trim whitespace to avoid "empty query" errors from trailing newlines
     const sql = std.mem.trim(u8, raw_sql, " \t\n\r");
@@ -377,11 +471,11 @@ fn executeMigration(db: *sqlite.Db, migration: Migration, table_name: []const u8
     // Get current timestamp
     const timestamp = getTimestamp();
 
-    // Record migration
+    // Record migration with hash
     const insert_sql = std.fmt.allocPrint(
         std.heap.page_allocator,
-        "INSERT INTO {s} (name, run_at) VALUES ('{s}', '{s}')",
-        .{ table_name, migration.name, timestamp },
+        "INSERT INTO {s} (name, run_at, hash) VALUES ('{s}', '{s}', '{s}')",
+        .{ table_name, migration.name, timestamp, hash },
     ) catch return MigrationError.SqlExecutionError;
     defer std.heap.page_allocator.free(insert_sql);
 
@@ -446,6 +540,9 @@ fn runUp(allocator: Allocator, config: Config) !void {
     // Get already-run migrations
     const run_migrations = try getRunMigrations(allocator, &db, config.table_name);
 
+    // Verify hashes of already-run migrations
+    try verifyMigrationHashes(allocator, migrations, run_migrations);
+
     // Find max run migration number
     var max_run_number: u32 = 0;
     var run_names = std.StringHashMap(void).init(allocator);
@@ -489,7 +586,7 @@ fn runUp(allocator: Allocator, config: Config) !void {
 
     for (pending.items) |migration| {
         std.debug.print("  Running: {s}...", .{migration.name});
-        try executeMigration(&db, migration, config.table_name);
+        try executeMigration(allocator, &db, migration, config.table_name);
         std.debug.print(" done\n", .{});
     }
 
@@ -501,6 +598,15 @@ fn runStatus(allocator: Allocator, config: Config) !void {
     std.fs.cwd().access(config.db_path, .{}) catch {
         std.debug.print("Error: Database file not found: {s}\n", .{config.db_path});
         return;
+    };
+
+    // Load migrations from directory (needed for hash verification)
+    const migrations = loadMigrations(allocator, config.migrations_path) catch |err| {
+        if (err == MigrationError.MigrationDirectoryNotFound) {
+            std.debug.print("Error: Migrations directory not found: {s}\n", .{config.migrations_path});
+            return err;
+        }
+        return err;
     };
 
     // Open database
@@ -537,6 +643,9 @@ fn runStatus(allocator: Allocator, config: Config) !void {
         std.debug.print("No migrations have been run yet.\n", .{});
         return;
     }
+
+    // Verify hashes of run migrations
+    try verifyMigrationHashes(allocator, migrations, run_migrations);
 
     // Print header
     std.debug.print("Run migrations:\n\n", .{});
