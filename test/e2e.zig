@@ -137,41 +137,31 @@ fn openDb(allocator: Allocator, db_path: []const u8) !sqlite.Db {
     const path_z = try allocator.dupeZ(u8, db_path);
     defer allocator.free(path_z);
 
-    return sqlite.Db.init(.{
-        .mode = .{ .File = path_z },
-        .open_flags = .{
-            .write = false,
-            .create = false,
-        },
-    });
+    return sqlite.Db.open(path_z, .{ .write = false, .create = false });
 }
 
 fn tableExists(allocator: Allocator, db: *sqlite.Db, table_name: []const u8) !bool {
-    const query = try std.fmt.allocPrint(allocator, "SELECT name FROM sqlite_master WHERE type='table' AND name='{s}'", .{table_name});
+    const query_slice = try std.fmt.allocPrint(allocator, "SELECT name FROM sqlite_master WHERE type='table' AND name='{s}'", .{table_name});
+    defer allocator.free(query_slice);
+    const query = try allocator.dupeZ(u8, query_slice);
     defer allocator.free(query);
 
-    var stmt = db.prepareDynamicWithDiags(query, .{}) catch {
+    var stmt = db.prepare(query) catch {
         return false;
     };
     defer stmt.deinit();
 
-    // Use oneAlloc for struct with []const u8 field
-    const row = stmt.oneAlloc(struct { name: []const u8 }, allocator, .{}, .{}) catch {
+    const has_row = stmt.step() catch {
         return false;
     };
-
-    if (row) |r| {
-        allocator.free(r.name);
-        return true;
-    }
-    return false;
+    return has_row;
 }
 
 fn getRecordedMigrations(allocator: Allocator, db: *sqlite.Db, table_name: []const u8) ![][]const u8 {
     const query = try std.fmt.allocPrint(allocator, "SELECT name FROM {s} ORDER BY id", .{table_name});
     defer allocator.free(query);
 
-    var stmt = db.prepareDynamicWithDiags(query, .{}) catch |err| {
+    var stmt = db.prepareDynamic(allocator, query) catch |err| {
         std.debug.print("Failed to prepare query: {}\n", .{err});
         return err;
     };
@@ -183,12 +173,12 @@ fn getRecordedMigrations(allocator: Allocator, db: *sqlite.Db, table_name: []con
         results.deinit(allocator);
     }
 
-    var iter = try stmt.iteratorAlloc(struct { name: []const u8 }, allocator, .{});
-    while (try iter.nextAlloc(allocator, .{})) |row| {
-        // row.name is allocated by sqlite, we dupe it and then must free the original
-        const name_copy = try allocator.dupe(u8, row.name);
-        allocator.free(row.name);
-        try results.append(allocator, name_copy);
+    while (true) {
+        const has_row = try stmt.step();
+        if (!has_row) break;
+
+        const name = try stmt.columnTextAlloc(allocator, 0) orelse continue;
+        try results.append(allocator, name);
     }
 
     return results.toOwnedSlice(allocator);
@@ -503,10 +493,7 @@ test "e2e: status - empty (no migrations run)" {
     {
         const path_z = try allocator.dupeZ(u8, tmp.db_path);
         defer allocator.free(path_z);
-        var db = try sqlite.Db.init(.{
-            .mode = .{ .File = path_z },
-            .open_flags = .{ .write = true, .create = true },
-        });
+        var db = try sqlite.Db.open(path_z, .{ .write = true, .create = true });
         db.deinit();
     }
 
@@ -779,12 +766,13 @@ test "e2e: hash stored in migrations table" {
     var db = try openDb(allocator, tmp.db_path);
     defer db.deinit();
 
-    var stmt = db.prepareDynamicWithDiags("SELECT hash FROM schema_migrations WHERE name = '001_create_users.sql'", .{}) catch unreachable;
+    var stmt = try db.prepare("SELECT hash FROM schema_migrations WHERE name = '001_create_users.sql'");
     defer stmt.deinit();
 
-    const row = (stmt.oneAlloc(struct { hash: ?[]const u8 }, allocator, .{}, .{}) catch unreachable).?;
-    defer if (row.hash) |h| allocator.free(h);
+    const has_row = try stmt.step();
+    try std.testing.expect(has_row);
 
-    try std.testing.expect(row.hash != null);
-    try std.testing.expectEqual(@as(usize, 64), row.hash.?.len); // SHA256 = 64 hex chars
+    const hash = stmt.columnText(0);
+    try std.testing.expect(hash != null);
+    try std.testing.expectEqual(@as(usize, 64), hash.?.len); // SHA256 = 64 hex chars
 }

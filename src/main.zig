@@ -244,8 +244,8 @@ fn parseMigrationNumber(filename: []const u8) !u32 {
     const number_str = filename[0..underscore_pos];
 
     // Validate all characters are digits
-    for (number_str) |c| {
-        if (c < '0' or c > '9') {
+    for (number_str) |ch| {
+        if (ch < '0' or ch > '9') {
             return MigrationError.InvalidFilenameFormat;
         }
     }
@@ -325,54 +325,45 @@ fn loadMigrations(allocator: Allocator, dir_path: []const u8) ![]Migration {
 // Database Operations
 // ============================================================================
 
-fn openDatabase(allocator: Allocator, db_path: []const u8) !sqlite.Db {
-    // Convert to sentinel-terminated string for C API
+fn openDatabase(allocator: Allocator, db_path: []const u8, flags: sqlite.OpenFlags) !sqlite.Db {
     const path_z = allocator.dupeZ(u8, db_path) catch {
         return MigrationError.DatabaseError;
     };
     defer allocator.free(path_z);
 
-    return sqlite.Db.init(.{
-        .mode = .{ .File = path_z },
-        .open_flags = .{
-            .write = true,
-            .create = true,
-        },
-    }) catch {
+    return sqlite.Db.open(path_z, flags) catch {
         return MigrationError.DatabaseError;
     };
 }
 
-fn createMigrationsTable(db: *sqlite.Db, table_name: []const u8) !void {
+fn createMigrationsTable(allocator: Allocator, db: *sqlite.Db, table_name: []const u8) !void {
     // Build CREATE TABLE statement
-    const create_sql = std.fmt.allocPrint(
-        std.heap.page_allocator,
+    const create_sql_slice = std.fmt.allocPrint(
+        allocator,
         "CREATE TABLE IF NOT EXISTS {s} (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, run_at TEXT NOT NULL, hash TEXT)",
         .{table_name},
     ) catch return MigrationError.DatabaseError;
-    defer std.heap.page_allocator.free(create_sql);
+    defer allocator.free(create_sql_slice);
+    const create_sql = allocator.dupeZ(u8, create_sql_slice) catch return MigrationError.DatabaseError;
+    defer allocator.free(create_sql);
 
-    db.execDynamic(create_sql, .{}, .{}) catch {
+    db.exec(create_sql) catch {
         return MigrationError.DatabaseError;
     };
 
     // Add hash column if it doesn't exist (for existing databases)
-    const alter_sql = std.fmt.allocPrint(
-        std.heap.page_allocator,
+    const alter_sql_slice = std.fmt.allocPrint(
+        allocator,
         "ALTER TABLE {s} ADD COLUMN hash TEXT",
         .{table_name},
     ) catch return MigrationError.DatabaseError;
-    defer std.heap.page_allocator.free(alter_sql);
+    defer allocator.free(alter_sql_slice);
+    const alter_sql = allocator.dupeZ(u8, alter_sql_slice) catch return MigrationError.DatabaseError;
+    defer allocator.free(alter_sql);
 
     // Ignore error if column already exists
-    db.execDynamic(alter_sql, .{}, .{}) catch {};
+    db.exec(alter_sql) catch {};
 }
-
-const MigrationRow = struct {
-    name: []const u8,
-    run_at: []const u8,
-    hash: ?[]const u8,
-};
 
 fn getRunMigrations(allocator: Allocator, db: *sqlite.Db, table_name: []const u8) ![]RunMigration {
     const query = std.fmt.allocPrint(
@@ -382,7 +373,7 @@ fn getRunMigrations(allocator: Allocator, db: *sqlite.Db, table_name: []const u8
     ) catch return MigrationError.DatabaseError;
     defer allocator.free(query);
 
-    var stmt = db.prepareDynamicWithDiags(query, .{}) catch {
+    var stmt = db.prepareDynamic(allocator, query) catch {
         return MigrationError.DatabaseError;
     };
     defer stmt.deinit();
@@ -390,32 +381,44 @@ fn getRunMigrations(allocator: Allocator, db: *sqlite.Db, table_name: []const u8
     var results: std.ArrayList(RunMigration) = .empty;
     errdefer results.deinit(allocator);
 
-    var iter = stmt.iteratorAlloc(MigrationRow, allocator, .{}) catch {
-        return MigrationError.DatabaseError;
-    };
-
     while (true) {
-        const row = iter.nextAlloc(allocator, .{}) catch {
+        const has_row = stmt.step() catch {
             return MigrationError.DatabaseError;
         };
-        if (row == null) break;
+        if (!has_row) break;
 
-        const r = row.?;
-        const name = r.name;
-        const run_at = r.run_at;
-        const hash = r.hash;
+        const name = stmt.columnTextAlloc(allocator, 0) catch {
+            return MigrationError.DatabaseError;
+        } orelse continue;
+
+        const run_at = stmt.columnTextAlloc(allocator, 1) catch {
+            allocator.free(name);
+            return MigrationError.DatabaseError;
+        } orelse {
+            allocator.free(name);
+            continue;
+        };
+
+        const hash = stmt.columnTextAlloc(allocator, 2) catch {
+            allocator.free(name);
+            allocator.free(run_at);
+            return MigrationError.DatabaseError;
+        };
 
         // Parse migration number from name
         const number = parseMigrationNumber(name) catch {
             // Skip invalid entries (shouldn't happen but be safe)
+            allocator.free(name);
+            allocator.free(run_at);
+            if (hash) |h| allocator.free(h);
             continue;
         };
 
         try results.append(allocator, .{
-            .name = try allocator.dupe(u8, name),
+            .name = name,
             .number = number,
-            .run_at = try allocator.dupe(u8, run_at),
-            .hash = if (hash) |h| try allocator.dupe(u8, h) else null,
+            .run_at = run_at,
+            .hash = hash,
         });
     }
 
@@ -437,7 +440,7 @@ fn executeMigration(allocator: Allocator, db: *sqlite.Db, migration: Migration, 
     const hash = try computeFileHash(allocator, migration.path);
     defer allocator.free(hash);
 
-    // Trim whitespace to avoid "empty query" errors from trailing newlines
+    // Trim whitespace to avoid issues with empty statements
     const sql = std.mem.trim(u8, raw_sql, " \t\n\r");
     if (sql.len == 0) {
         // Empty migration file - nothing to do
@@ -445,47 +448,41 @@ fn executeMigration(allocator: Allocator, db: *sqlite.Db, migration: Migration, 
     }
 
     // Begin transaction
-    db.execDynamic("BEGIN TRANSACTION", .{}, .{}) catch {
+    db.exec("BEGIN TRANSACTION") catch {
         return MigrationError.SqlExecutionError;
     };
     errdefer {
-        db.execDynamic("ROLLBACK", .{}, .{}) catch {};
+        db.exec("ROLLBACK") catch {};
     }
 
-    // Execute migration SQL using exec for multi-statement support
-    // Note: execMulti has a bug with trailing whitespace, so we catch EmptyQuery and treat it as success
-    db.execMulti(sql, .{}) catch |err| {
-        // EmptyQuery can happen if SQL ends with whitespace after last statement - that's OK
-        if (err == error.EmptyQuery) {
-            // This is fine - the SQL was executed successfully
-        } else {
-            std.debug.print("Error executing migration {s}: {}\n", .{ migration.name, err });
-            // Get detailed error from SQLite
-            const detail = db.getDetailedError();
-            std.debug.print("SQLite error: {s}\n", .{detail.message});
-            db.execDynamic("ROLLBACK", .{}, .{}) catch {};
-            return MigrationError.SqlExecutionError;
-        }
+    // Execute migration SQL using execMulti for multi-statement support
+    db.execMulti(sql) catch |err| {
+        std.debug.print("Error executing migration {s}: {}\n", .{ migration.name, err });
+        std.debug.print("SQLite error: {s}\n", .{db.getErrorMessage()});
+        db.exec("ROLLBACK") catch {};
+        return MigrationError.SqlExecutionError;
     };
 
     // Get current timestamp
     const timestamp = getTimestamp();
 
     // Record migration with hash
-    const insert_sql = std.fmt.allocPrint(
+    const insert_sql_slice = std.fmt.allocPrint(
         std.heap.page_allocator,
         "INSERT INTO {s} (name, run_at, hash) VALUES ('{s}', '{s}', '{s}')",
         .{ table_name, migration.name, timestamp, hash },
     ) catch return MigrationError.SqlExecutionError;
+    defer std.heap.page_allocator.free(insert_sql_slice);
+    const insert_sql = std.heap.page_allocator.dupeZ(u8, insert_sql_slice) catch return MigrationError.SqlExecutionError;
     defer std.heap.page_allocator.free(insert_sql);
 
-    db.execDynamic(insert_sql, .{}, .{}) catch {
-        db.execDynamic("ROLLBACK", .{}, .{}) catch {};
+    db.exec(insert_sql) catch {
+        db.exec("ROLLBACK") catch {};
         return MigrationError.SqlExecutionError;
     };
 
     // Commit transaction
-    db.execDynamic("COMMIT", .{}, .{}) catch {
+    db.exec("COMMIT") catch {
         return MigrationError.SqlExecutionError;
     };
 }
@@ -531,11 +528,11 @@ fn runUp(allocator: Allocator, config: Config) !void {
     }
 
     // Open database
-    var db = try openDatabase(allocator, config.db_path);
+    var db = try openDatabase(allocator, config.db_path, .{ .write = true, .create = true });
     defer db.deinit();
 
     // Create migrations table
-    try createMigrationsTable(&db, config.table_name);
+    try createMigrationsTable(allocator, &db, config.table_name);
 
     // Get already-run migrations
     const run_migrations = try getRunMigrations(allocator, &db, config.table_name);
@@ -610,26 +607,27 @@ fn runStatus(allocator: Allocator, config: Config) !void {
     };
 
     // Open database
-    var db = try openDatabase(allocator, config.db_path);
+    var db = try openDatabase(allocator, config.db_path, .{ .write = false, .create = false });
     defer db.deinit();
 
     // Check if migrations table exists
-    const check_sql = std.fmt.allocPrint(
+    const check_sql_slice = std.fmt.allocPrint(
         allocator,
         "SELECT name FROM sqlite_master WHERE type='table' AND name='{s}'",
         .{config.table_name},
     ) catch return MigrationError.DatabaseError;
+    defer allocator.free(check_sql_slice);
+    const check_sql = allocator.dupeZ(u8, check_sql_slice) catch return MigrationError.DatabaseError;
     defer allocator.free(check_sql);
 
-    var check_stmt = db.prepareDynamicWithDiags(check_sql, .{}) catch {
+    var check_stmt = db.prepare(check_sql) catch {
         return MigrationError.DatabaseError;
     };
     defer check_stmt.deinit();
 
-    // Use oneAlloc() to check if table exists (returns single row or null)
-    const table_exists = (check_stmt.oneAlloc(struct { name: []const u8 }, allocator, .{}, .{}) catch {
+    const table_exists = (check_stmt.step() catch {
         return MigrationError.DatabaseError;
-    }) != null;
+    });
 
     if (!table_exists) {
         std.debug.print("No migrations have been run yet.\n", .{});

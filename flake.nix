@@ -19,7 +19,7 @@
       perSystem = { self', system, lib, ... }:
         let
           env = inputs.zig2nix.outputs.zig-env.${system} {
-            zig = inputs.zig2nix.outputs.packages.${system}.zig-latest;
+            zig = inputs.zig2nix.outputs.packages.${system}.zig-0_15_2;
           };
           pkgs = env.pkgs;
         in
@@ -27,22 +27,13 @@
           packages = {
             litem8 = env.package {
               src = lib.cleanSource ./.;
+
+              # No external dependencies - SQLite is bundled
               nativeBuildInputs = [ ];
               buildInputs = [ ];
 
-              # Copy the zig-built libsqlite.so to output and fix RPATH before the check runs
-              preFixup = ''
-                # Find libsqlite.so in the build cache
-                SQLITE_SRC=$(find /build -name "libsqlite.so" -type f 2>/dev/null | head -1 || true)
-                if [ -n "$SQLITE_SRC" ]; then
-                  mkdir -p $out/lib
-                  cp "$SQLITE_SRC" $out/lib/
-                  ${pkgs.patchelf}/bin/patchelf --set-rpath "$out/lib" $out/bin/litem8
-                fi
-              '';
-
               meta = {
-                description = "SQLite migration tool";
+                description = "SQLite migration tool - self-contained with bundled SQLite";
                 mainProgram = "litem8";
               };
             };
@@ -59,9 +50,7 @@
           };
 
           devShells.default = env.mkShell {
-            nativeBuildInputs = [
-              pkgs.sqlite
-            ];
+            nativeBuildInputs = [ ];
           };
         };
     };

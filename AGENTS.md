@@ -88,58 +88,68 @@ const month_day = year_day.calculateMonthDay();
 
 `std.StringHashMap` and `std.HashMap` still have the managed version with `.init(allocator)`, but consider using the unmanaged variants for consistency with ArrayList.
 
-## zig-sqlite Notes
+## Native SQLite Bindings
 
-This project uses [zig-sqlite](https://github.com/vrischmann/zig-sqlite) (branch `zig-0.15.1`).
+This project uses bundled SQLite source (`deps/sqlite/sqlite3.c`) with native C bindings in `src/sqlite.zig`. No external SQLite library dependencies are required.
 
-### Dynamic vs Static Queries
-
-- Use `db.prepare()` or `db.prepareWithDiags()` for **comptime-known** query strings
-- Use `db.prepareDynamic()` or `db.prepareDynamicWithDiags()` for **runtime** query strings (e.g., when table name is a parameter)
-
-### File Path Requirements
-
-SQLite requires null-terminated strings for file paths:
+### Opening a Database
 
 ```zig
-// Convert []const u8 to [:0]const u8
+const sqlite = @import("sqlite");
+
+// Open database (SQLite is auto-initialized on first use)
 const path_z = try allocator.dupeZ(u8, db_path);
 defer allocator.free(path_z);
 
-var db = try sqlite.Db.init(.{
-    .mode = .{ .File = path_z },
-    // ...
-});
+var db = try sqlite.Db.open(path_z, .{ .write = true, .create = true });
+defer db.deinit();
 ```
 
-### execMulti Quirk
-
-The `db.execMulti()` function may throw `error.EmptyQuery` when SQL has trailing whitespace after the last statement. Handle this case:
+### Executing SQL
 
 ```zig
-db.execMulti(sql, .{}) catch |err| {
-    if (err == error.EmptyQuery) {
-        // This is fine - SQL executed successfully
-    } else {
-        return err;
-    }
-};
+// Execute single statement (null-terminated)
+try db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY)");
+
+// Execute multiple statements
+try db.execMulti("CREATE TABLE a (id INT); CREATE TABLE b (id INT);");
 ```
 
-### Iterating Dynamic Queries
-
-For dynamic statements, use `.iterator()` or `.iteratorAlloc()`:
+### Prepared Statements
 
 ```zig
-var stmt = try db.prepareDynamicWithDiags(query, .{});
+// For compile-time known SQL (null-terminated)
+var stmt = try db.prepare("SELECT name FROM users WHERE id = ?");
 defer stmt.deinit();
 
-var iter = try stmt.iteratorAlloc(RowType, allocator, .{});
-while (try iter.nextAlloc(allocator, .{})) |row| {
-    // process row
+// For runtime SQL
+var stmt2 = try db.prepareDynamic(allocator, sql_string);
+defer stmt2.deinit();
+
+// Bind parameters (1-indexed)
+try stmt.bindText(1, name);
+try stmt.bindNull(2);
+
+// Execute and iterate
+while (try stmt.step()) {
+    const name = stmt.columnText(0);  // Returns ?[]const u8
+    const id = stmt.columnInt(1);      // Returns i32
 }
+
+// Or get allocated copy
+const name = try stmt.columnTextAlloc(allocator, 0);
 ```
 
-### Reading TEXT columns
+### Building
 
-When reading `[]const u8` fields from the database, you must use `oneAlloc` or `iteratorAlloc` with an allocator - the non-allocating versions cannot read slice types.
+The project builds statically linked binaries for distribution:
+
+```bash
+# Debug build (native)
+zig build
+
+# Static release binaries for all platforms
+zig build release
+
+# Output in zig-out/{arch}-{os}/
+```
