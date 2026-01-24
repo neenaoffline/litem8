@@ -46,16 +46,9 @@ jobs:
           name: static-binaries
           path: release/
 
-  # Dynamic glibc builds (for Debian, Ubuntu, Fedora, etc.)
-  build-dynamic-glibc:
-    strategy:
-      matrix:
-        include:
-          - arch: x86_64
-            runner: ubuntu-latest
-          - arch: aarch64
-            runner: ubuntu-24.04-arm
-    runs-on: ${{ matrix.runner }}
+  # Dynamic glibc x86_64 build (native)
+  build-dynamic-glibc-x86_64:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -69,20 +62,59 @@ jobs:
 
       - name: Build dynamic glibc binary
         run: |
-          mkdir -p zig-out/${{ matrix.arch }}-linux-gnu
+          mkdir -p zig-out/x86_64-linux-gnu
           zig build-exe src/main.zig \
             -OReleaseSafe \
             -lsqlite3 -lc \
             --dep litem8 -Mlitem8=src/root.zig \
             --dep sqlite -Msqlite=src/sqlite.zig \
             --name litem8 \
-            -femit-bin=zig-out/${{ matrix.arch }}-linux-gnu/litem8
+            -femit-bin=zig-out/x86_64-linux-gnu/litem8
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dynamic-glibc-${{ matrix.arch }}
-          path: zig-out/${{ matrix.arch }}-linux-gnu/litem8
+          name: dynamic-glibc-x86_64
+          path: zig-out/x86_64-linux-gnu/litem8
+
+  # Dynamic glibc aarch64 build (via Docker + QEMU)
+  build-dynamic-glibc-aarch64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build in Debian ARM64 container
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v ${{ github.workspace }}:/build \
+            -w /build \
+            debian:bookworm-slim \
+            bash -c '
+              apt-get update && apt-get install -y curl xz-utils libsqlite3-dev
+              
+              # Install Zig
+              curl -fsSL "https://ziglang.org/download/0.15.2/zig-linux-aarch64-0.15.2.tar.xz" -o /tmp/zig.tar.xz
+              tar -xJf /tmp/zig.tar.xz -C /opt
+              export PATH="/opt/zig-linux-aarch64-0.15.2:$PATH"
+              
+              mkdir -p zig-out/aarch64-linux-gnu
+              zig build-exe src/main.zig \
+                -OReleaseSafe \
+                -lsqlite3 -lc \
+                --dep litem8 -Mlitem8=src/root.zig \
+                --dep sqlite -Msqlite=src/sqlite.zig \
+                --name litem8 \
+                -femit-bin=zig-out/aarch64-linux-gnu/litem8
+            '
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dynamic-glibc-aarch64
+          path: zig-out/aarch64-linux-gnu/litem8
 
   # Dynamic musl builds (for Alpine Linux)
   build-dynamic-musl:
@@ -91,8 +123,10 @@ jobs:
         include:
           - arch: x86_64
             platform: linux/amd64
+            zig_arch: x86_64
           - arch: aarch64
             platform: linux/arm64
+            zig_arch: aarch64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -107,13 +141,12 @@ jobs:
             -w /build \
             alpine:latest \
             sh -c '
-              apk add --no-cache curl xz sqlite-dev musl-dev
+              apk add --no-cache curl xz sqlite-dev
               
               # Install Zig
-              ZIG_ARCH=$(uname -m)
-              curl -fsSL "https://ziglang.org/download/0.15.2/zig-linux-${ZIG_ARCH}-0.15.2.tar.xz" -o /tmp/zig.tar.xz
+              curl -fsSL "https://ziglang.org/download/0.15.2/zig-linux-${{ matrix.zig_arch }}-0.15.2.tar.xz" -o /tmp/zig.tar.xz
               tar -xJf /tmp/zig.tar.xz -C /opt
-              export PATH="/opt/zig-linux-${ZIG_ARCH}-0.15.2:$PATH"
+              export PATH="/opt/zig-linux-${{ matrix.zig_arch }}-0.15.2:$PATH"
               
               mkdir -p zig-out/${{ matrix.arch }}-linux-musl
               zig build-exe src/main.zig \
@@ -133,7 +166,7 @@ jobs:
 
   # Create release with all artifacts
   release:
-    needs: [build-static, build-dynamic-glibc, build-dynamic-musl]
+    needs: [build-static, build-dynamic-glibc-x86_64, build-dynamic-glibc-aarch64, build-dynamic-musl]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -159,6 +192,10 @@ jobs:
           # Create checksums
           cd release
           sha256sum * > SHA256SUMS
+          
+          # Show what we're releasing
+          echo "=== Release artifacts ==="
+          ls -lh
 
       - name: Create release
         uses: softprops/action-gh-release@v1
