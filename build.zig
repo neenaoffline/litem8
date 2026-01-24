@@ -16,6 +16,65 @@ const sqlite_cflags: []const []const u8 = &.{
     "-DSQLITE_OMIT_AUTOINIT", // Require explicit init
 };
 
+/// Build configuration for a target
+const BuildConfig = struct {
+    target: std.Target.Query,
+    /// If true, bundle SQLite source. If false, link to system libsqlite3.
+    bundle_sqlite: bool = true,
+    /// Output directory name
+    output_dir: []const u8,
+};
+
+/// Create an executable with the given configuration
+fn createExecutable(
+    b: *std.Build,
+    config: BuildConfig,
+    mod: *std.Build.Module,
+) *std.Build.Step.Compile {
+    const resolved_target = b.resolveTargetQuery(config.target);
+
+    // Create SQLite module
+    const sqlite_mod = b.addModule(b.fmt("sqlite-{s}", .{config.output_dir}), .{
+        .root_source_file = b.path("src/sqlite.zig"),
+        .target = resolved_target,
+        .optimize = .ReleaseSafe,
+    });
+
+    if (config.bundle_sqlite) {
+        sqlite_mod.addIncludePath(b.path("deps/sqlite"));
+    }
+
+    // Create executable
+    const exe = b.addExecutable(.{
+        .name = "litem8",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = resolved_target,
+            .optimize = .ReleaseSafe,
+            .imports = &.{
+                .{ .name = "litem8", .module = mod },
+                .{ .name = "sqlite", .module = sqlite_mod },
+            },
+        }),
+    });
+
+    if (config.bundle_sqlite) {
+        // Compile SQLite from bundled source
+        exe.addCSourceFile(.{
+            .file = b.path("deps/sqlite/sqlite3.c"),
+            .flags = sqlite_cflags,
+        });
+        exe.addIncludePath(b.path("deps/sqlite"));
+    } else {
+        // Link against system libsqlite3
+        exe.root_module.linkSystemLibrary("sqlite3", .{});
+    }
+
+    exe.linkLibC();
+
+    return exe;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -122,69 +181,77 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_e2e_tests.step);
 
     // =========================================================================
-    // Cross-compilation targets for static binaries
+    // Release targets - static binaries with bundled SQLite
     // =========================================================================
 
-    const release_step = b.step("release", "Build static release binaries for all platforms");
+    const release_step = b.step("release", "Build static release binaries (bundled SQLite) for all platforms");
 
-    const targets: []const std.Target.Query = &.{
+    const static_targets: []const BuildConfig = &.{
         // Linux (musl for static linking)
-        .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl },
-        .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl },
-        .{ .cpu_arch = .arm, .os_tag = .linux, .abi = .musleabihf },
-        .{ .cpu_arch = .riscv64, .os_tag = .linux, .abi = .musl },
+        .{ .target = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl }, .output_dir = "x86_64-linux-musl-static" },
+        .{ .target = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl }, .output_dir = "aarch64-linux-musl-static" },
+        .{ .target = .{ .cpu_arch = .arm, .os_tag = .linux, .abi = .musleabihf }, .output_dir = "arm-linux-musl-static" },
+        .{ .target = .{ .cpu_arch = .riscv64, .os_tag = .linux, .abi = .musl }, .output_dir = "riscv64-linux-musl-static" },
         // macOS
-        .{ .cpu_arch = .x86_64, .os_tag = .macos },
-        .{ .cpu_arch = .aarch64, .os_tag = .macos },
+        .{ .target = .{ .cpu_arch = .x86_64, .os_tag = .macos }, .output_dir = "x86_64-macos" },
+        .{ .target = .{ .cpu_arch = .aarch64, .os_tag = .macos }, .output_dir = "aarch64-macos" },
         // Windows
-        .{ .cpu_arch = .x86_64, .os_tag = .windows },
-        .{ .cpu_arch = .aarch64, .os_tag = .windows },
+        .{ .target = .{ .cpu_arch = .x86_64, .os_tag = .windows }, .output_dir = "x86_64-windows" },
+        .{ .target = .{ .cpu_arch = .aarch64, .os_tag = .windows }, .output_dir = "aarch64-windows" },
     };
 
-    for (targets) |t| {
-        const release_target = b.resolveTargetQuery(t);
-
-        const rel_sqlite_mod = b.addModule(b.fmt("sqlite-{s}-{s}", .{
-            @tagName(t.cpu_arch orelse .x86_64),
-            @tagName(t.os_tag orelse .linux),
-        }), .{
-            .root_source_file = b.path("src/sqlite.zig"),
-            .target = release_target,
-            .optimize = .ReleaseSafe,
-        });
-        rel_sqlite_mod.addIncludePath(b.path("deps/sqlite"));
-
-        const rel_exe = b.addExecutable(.{
-            .name = "litem8",
-            .root_module = b.createModule(.{
-                .root_source_file = b.path("src/main.zig"),
-                .target = release_target,
-                .optimize = .ReleaseSafe,
-                .imports = &.{
-                    .{ .name = "litem8", .module = mod },
-                    .{ .name = "sqlite", .module = rel_sqlite_mod },
-                },
-            }),
-        });
-
-        rel_exe.addCSourceFile(.{
-            .file = b.path("deps/sqlite/sqlite3.c"),
-            .flags = sqlite_cflags,
-        });
-        rel_exe.addIncludePath(b.path("deps/sqlite"));
-        rel_exe.linkLibC();
-
+    for (static_targets) |config| {
+        const rel_exe = createExecutable(b, config, mod);
         const target_output = b.addInstallArtifact(rel_exe, .{
-            .dest_dir = .{
-                .override = .{
-                    .custom = b.fmt("{s}-{s}", .{
-                        @tagName(t.cpu_arch orelse .x86_64),
-                        @tagName(t.os_tag orelse .linux),
-                    }),
-                },
-            },
+            .dest_dir = .{ .override = .{ .custom = config.output_dir } },
         });
-
         release_step.dependOn(&target_output.step);
     }
+
+    // =========================================================================
+    // Release targets - dynamic binaries linking to system SQLite
+    // =========================================================================
+
+    const release_dynamic_step = b.step("release-dynamic", "Build dynamic release binaries (system SQLite) for Linux");
+
+    const dynamic_targets: []const BuildConfig = &.{
+        // Linux glibc (dynamic linking)
+        .{
+            .target = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu },
+            .bundle_sqlite = false,
+            .output_dir = "x86_64-linux-gnu",
+        },
+        .{
+            .target = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu },
+            .bundle_sqlite = false,
+            .output_dir = "aarch64-linux-gnu",
+        },
+        // Linux musl (dynamic linking)
+        .{
+            .target = .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl },
+            .bundle_sqlite = false,
+            .output_dir = "x86_64-linux-musl",
+        },
+        .{
+            .target = .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl },
+            .bundle_sqlite = false,
+            .output_dir = "aarch64-linux-musl",
+        },
+    };
+
+    for (dynamic_targets) |config| {
+        const rel_exe = createExecutable(b, config, mod);
+        const target_output = b.addInstallArtifact(rel_exe, .{
+            .dest_dir = .{ .override = .{ .custom = config.output_dir } },
+        });
+        release_dynamic_step.dependOn(&target_output.step);
+    }
+
+    // =========================================================================
+    // Combined release-all target
+    // =========================================================================
+
+    const release_all_step = b.step("release-all", "Build all release binaries (static + dynamic)");
+    release_all_step.dependOn(release_step);
+    release_all_step.dependOn(release_dynamic_step);
 }

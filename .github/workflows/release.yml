@@ -8,9 +8,9 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  # Static builds with bundled SQLite (cross-compiled from Ubuntu)
+  build-static:
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
@@ -19,18 +19,18 @@ jobs:
         with:
           version: 0.15.2
 
-      - name: Build all release targets
+      - name: Build all static release targets
         run: zig build release
 
-      - name: Prepare artifacts
+      - name: Prepare static artifacts
         run: |
           mkdir -p release
           
-          # Linux (static musl binaries)
-          cp zig-out/x86_64-linux/litem8 release/litem8-linux-x86_64
-          cp zig-out/aarch64-linux/litem8 release/litem8-linux-aarch64
-          cp zig-out/arm-linux/litem8 release/litem8-linux-arm
-          cp zig-out/riscv64-linux/litem8 release/litem8-linux-riscv64
+          # Linux musl (static, bundled SQLite)
+          cp zig-out/x86_64-linux-musl-static/litem8 release/litem8-linux-x86_64-static
+          cp zig-out/aarch64-linux-musl-static/litem8 release/litem8-linux-aarch64-static
+          cp zig-out/arm-linux-musl-static/litem8 release/litem8-linux-arm-static
+          cp zig-out/riscv64-linux-musl-static/litem8 release/litem8-linux-riscv64-static
           
           # macOS
           cp zig-out/x86_64-macos/litem8 release/litem8-macos-x86_64
@@ -39,32 +39,149 @@ jobs:
           # Windows
           cp zig-out/x86_64-windows/litem8.exe release/litem8-windows-x86_64.exe
           cp zig-out/aarch64-windows/litem8.exe release/litem8-windows-aarch64.exe
+
+      - name: Upload static artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: static-binaries
+          path: release/
+
+  # Dynamic glibc builds (for Debian, Ubuntu, Fedora, etc.)
+  build-dynamic-glibc:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build dynamic glibc binary
+        run: |
+          mkdir -p zig-out/${{ matrix.arch }}-linux-gnu
+          zig build-exe src/main.zig \
+            -OReleaseSafe \
+            -lsqlite3 -lc \
+            --dep litem8 -Mlitem8=src/root.zig \
+            --dep sqlite -Msqlite=src/sqlite.zig \
+            --name litem8 \
+            -femit-bin=zig-out/${{ matrix.arch }}-linux-gnu/litem8
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dynamic-glibc-${{ matrix.arch }}
+          path: zig-out/${{ matrix.arch }}-linux-gnu/litem8
+
+  # Dynamic musl builds (for Alpine Linux)
+  build-dynamic-musl:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            platform: linux/amd64
+          - arch: aarch64
+            platform: linux/arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build in Alpine container
+        run: |
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v ${{ github.workspace }}:/build \
+            -w /build \
+            alpine:latest \
+            sh -c '
+              apk add --no-cache curl xz sqlite-dev musl-dev
+              
+              # Install Zig
+              ZIG_ARCH=$(uname -m)
+              curl -fsSL "https://ziglang.org/download/0.15.2/zig-linux-${ZIG_ARCH}-0.15.2.tar.xz" -o /tmp/zig.tar.xz
+              tar -xJf /tmp/zig.tar.xz -C /opt
+              export PATH="/opt/zig-linux-${ZIG_ARCH}-0.15.2:$PATH"
+              
+              mkdir -p zig-out/${{ matrix.arch }}-linux-musl
+              zig build-exe src/main.zig \
+                -OReleaseSafe \
+                -lsqlite3 -lc \
+                --dep litem8 -Mlitem8=src/root.zig \
+                --dep sqlite -Msqlite=src/sqlite.zig \
+                --name litem8 \
+                -femit-bin=zig-out/${{ matrix.arch }}-linux-musl/litem8
+            '
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dynamic-musl-${{ matrix.arch }}
+          path: zig-out/${{ matrix.arch }}-linux-musl/litem8
+
+  # Create release with all artifacts
+  release:
+    needs: [build-static, build-dynamic-glibc, build-dynamic-musl]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release
+        run: |
+          mkdir -p release
+          
+          # Static binaries
+          cp artifacts/static-binaries/* release/
+          
+          # Dynamic glibc binaries
+          cp artifacts/dynamic-glibc-x86_64/litem8 release/litem8-linux-x86_64-glibc
+          cp artifacts/dynamic-glibc-aarch64/litem8 release/litem8-linux-aarch64-glibc
+          
+          # Dynamic musl binaries (for Alpine)
+          cp artifacts/dynamic-musl-x86_64/litem8 release/litem8-linux-x86_64-musl
+          cp artifacts/dynamic-musl-aarch64/litem8 release/litem8-linux-aarch64-musl
           
           # Create checksums
           cd release
           sha256sum * > SHA256SUMS
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-binaries
-          path: release/
-
-  release:
-    needs: build
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: release-binaries
-          path: release
 
       - name: Create release
         uses: softprops/action-gh-release@v1
         with:
           files: release/*
           generate_release_notes: true
+          body: |
+            ## Binary Types
+            
+            ### Static binaries (bundled SQLite, no dependencies)
+            - `litem8-linux-x86_64-static` - Linux x86_64 (works on any distro)
+            - `litem8-linux-aarch64-static` - Linux ARM64 (works on any distro)
+            - `litem8-linux-arm-static` - Linux ARM 32-bit
+            - `litem8-linux-riscv64-static` - Linux RISC-V 64-bit
+            - `litem8-macos-x86_64` - macOS Intel
+            - `litem8-macos-aarch64` - macOS Apple Silicon
+            - `litem8-windows-x86_64.exe` - Windows x64
+            - `litem8-windows-aarch64.exe` - Windows ARM64
+            
+            ### Dynamic binaries (requires system libsqlite3)
+            - `litem8-linux-x86_64-glibc` - Linux x86_64 (Debian, Ubuntu, Fedora, etc.)
+            - `litem8-linux-aarch64-glibc` - Linux ARM64 (Debian, Ubuntu, Fedora, etc.)
+            - `litem8-linux-x86_64-musl` - Linux x86_64 (Alpine Linux)
+            - `litem8-linux-aarch64-musl` - Linux ARM64 (Alpine Linux)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
