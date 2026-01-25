@@ -78,6 +78,7 @@ fn createExecutable(
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const bundle_sqlite = b.option(bool, "bundle-sqlite", "Bundle SQLite source (default: true)") orelse true;
 
     // Create SQLite module - the C source is added to the executable, not the module
     const sqlite_mod = b.addModule("sqlite", .{
@@ -85,7 +86,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    sqlite_mod.addIncludePath(b.path("deps/sqlite"));
+    if (bundle_sqlite) {
+        sqlite_mod.addIncludePath(b.path("deps/sqlite"));
+    }
 
     // Library module
     const mod = b.addModule("litem8", .{
@@ -107,12 +110,17 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Add SQLite C source to the executable
-    exe.addCSourceFile(.{
-        .file = b.path("deps/sqlite/sqlite3.c"),
-        .flags = sqlite_cflags,
-    });
-    exe.addIncludePath(b.path("deps/sqlite"));
+    if (bundle_sqlite) {
+        // Add SQLite C source to the executable
+        exe.addCSourceFile(.{
+            .file = b.path("deps/sqlite/sqlite3.c"),
+            .flags = sqlite_cflags,
+        });
+        exe.addIncludePath(b.path("deps/sqlite"));
+    } else {
+        // Link against system libsqlite3
+        exe.root_module.linkSystemLibrary("sqlite3", .{});
+    }
     exe.linkLibC();
 
     b.installArtifact(exe);

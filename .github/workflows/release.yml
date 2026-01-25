@@ -61,21 +61,13 @@ jobs:
           version: 0.15.2
 
       - name: Build dynamic glibc binary
-        run: |
-          mkdir -p zig-out/x86_64-linux-gnu
-          zig build-exe src/main.zig \
-            -OReleaseSafe \
-            -lsqlite3 -lc \
-            --dep litem8 -Mlitem8=src/root.zig \
-            --dep sqlite -Msqlite=src/sqlite.zig \
-            --name litem8 \
-            -femit-bin=zig-out/x86_64-linux-gnu/litem8
+        run: zig build -Doptimize=ReleaseSafe -Dbundle-sqlite=false --prefix zig-out/x86_64-linux-gnu
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: dynamic-glibc-x86_64
-          path: zig-out/x86_64-linux-gnu/litem8
+          path: zig-out/x86_64-linux-gnu/bin/litem8
 
   # Dynamic glibc aarch64 build (via Docker + QEMU)
   build-dynamic-glibc-aarch64:
@@ -100,21 +92,14 @@ jobs:
               tar -xJf /tmp/zig.tar.xz -C /opt
               export PATH="/opt/zig-aarch64-linux-0.15.2:$PATH"
               
-              mkdir -p zig-out/aarch64-linux-gnu
-              zig build-exe src/main.zig \
-                -OReleaseSafe \
-                -lsqlite3 -lc \
-                --dep litem8 -Mlitem8=src/root.zig \
-                --dep sqlite -Msqlite=src/sqlite.zig \
-                --name litem8 \
-                -femit-bin=zig-out/aarch64-linux-gnu/litem8
+              zig build -Doptimize=ReleaseSafe -Dbundle-sqlite=false --prefix zig-out/aarch64-linux-gnu
             '
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: dynamic-glibc-aarch64
-          path: zig-out/aarch64-linux-gnu/litem8
+          path: zig-out/aarch64-linux-gnu/bin/litem8
 
   # Dynamic musl builds (for Alpine Linux)
   build-dynamic-musl:
@@ -148,21 +133,14 @@ jobs:
               tar -xJf /tmp/zig.tar.xz -C /opt
               export PATH="/opt/zig-${{ matrix.zig_arch }}-linux-0.15.2:$PATH"
               
-              mkdir -p zig-out/${{ matrix.arch }}-linux-musl
-              zig build-exe src/main.zig \
-                -OReleaseSafe \
-                -lsqlite3 -lc \
-                --dep litem8 -Mlitem8=src/root.zig \
-                --dep sqlite -Msqlite=src/sqlite.zig \
-                --name litem8 \
-                -femit-bin=zig-out/${{ matrix.arch }}-linux-musl/litem8
+              zig build -Doptimize=ReleaseSafe -Dbundle-sqlite=false --prefix zig-out/${{ matrix.arch }}-linux-musl
             '
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: dynamic-musl-${{ matrix.arch }}
-          path: zig-out/${{ matrix.arch }}-linux-musl/litem8
+          path: zig-out/${{ matrix.arch }}-linux-musl/bin/litem8
 
   # Create release with all artifacts
   release:
