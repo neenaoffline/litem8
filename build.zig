@@ -51,6 +51,7 @@ fn createExecutable(
             .root_source_file = b.path("src/main.zig"),
             .target = resolved_target,
             .optimize = .ReleaseSafe,
+            .strip = true,
             .imports = &.{
                 .{ .name = "litem8", .module = mod },
                 .{ .name = "sqlite", .module = sqlite_mod },
