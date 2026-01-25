@@ -80,6 +80,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const bundle_sqlite = b.option(bool, "bundle-sqlite", "Bundle SQLite source (default: true)") orelse true;
+    const strip = b.option(bool, "strip", "Strip debug info (default: true for release builds)") orelse (optimize != .Debug);
 
     // Create SQLite module - the C source is added to the executable, not the module
     const sqlite_mod = b.addModule("sqlite", .{
@@ -104,6 +105,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .strip = strip,
             .imports = &.{
                 .{ .name = "litem8", .module = mod },
                 .{ .name = "sqlite", .module = sqlite_mod },
