@@ -231,3 +231,284 @@ pub const Statement = struct {
         return c.sqlite3_column_type(self.handle, index) == c.SQLITE_NULL;
     }
 };
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "init can be called multiple times" {
+    try init();
+    try init();
+    try init();
+}
+
+test "open and close in-memory database" {
+    var db = try Db.open(":memory:", .{});
+    defer db.deinit();
+}
+
+test "open database with read-only flag on non-existent file fails" {
+    const result = Db.open("/nonexistent/path/db.sqlite", .{ .write = false, .create = false });
+    try std.testing.expectError(Error.SqliteError, result);
+}
+
+test "exec creates table" {
+    var db = try Db.open(":memory:", .{});
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT)");
+
+    // Verify table exists
+    var stmt = try db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='test'");
+    defer stmt.deinit();
+
+    const has_row = try stmt.step();
+    try std.testing.expect(has_row);
+    try std.testing.expectEqualStrings("test", stmt.columnText(0).?);
+}
+
+test "exec with invalid SQL returns error" {
+    var db = try Db.open(":memory:", .{});
+    defer db.deinit();
+
+    const result = db.exec("INVALID SQL SYNTAX");
+    try std.testing.expectError(Error.SqliteError, result);
+}
+
+test "execMulti runs multiple statements" {
+    var db = try Db.open(":memory:", .{});
+    defer db.deinit();
+
+    try db.execMulti(
+        \\CREATE TABLE a (id INTEGER);
+        \\CREATE TABLE b (id INTEGER);
+        \\INSERT INTO a VALUES (1);
+        \\INSERT INTO b VALUES (2);
+    );
+
+    // Verify both tables exist and have data
+    var stmt_a = try db.prepare("SELECT id FROM a");
+    defer stmt_a.deinit();
+    try std.testing.expect(try stmt_a.step());
+    try std.testing.expectEqual(@as(i32, 1), stmt_a.columnInt(0));
+
+    var stmt_b = try db.prepare("SELECT id FROM b");
+    defer stmt_b.deinit();
+    try std.testing.expect(try stmt_b.step());
+    try std.testing.expectEqual(@as(i32, 2), stmt_b.columnInt(0));
+}
+
+test "execMulti with SQL too large returns error" {
+    var db = try Db.open(":memory:", .{});
+    defer db.deinit();
+
+    // Create SQL larger than 64KB buffer
+    const large_sql = "SELECT 1;" ** 10000;
+    const result = db.execMulti(large_sql);
+    try std.testing.expectError(Error.OutOfMemory, result);
+}
+
+test "prepare and execute SELECT" {
+    var db = try Db.open(":memory:", .{});
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)");
+    try db.exec("INSERT INTO users (name, age) VALUES ('Alice', 30)");
+    try db.exec("INSERT INTO users (name, age) VALUES ('Bob', 25)");
+
+    var stmt = try db.prepare("SELECT name, age FROM users ORDER BY name");
+    defer stmt.deinit();
+
+    // First row
+    try std.testing.expect(try stmt.step());
+    try std.testing.expectEqualStrings("Alice", stmt.columnText(0).?);
+    try std.testing.expectEqual(@as(i32, 30), stmt.columnInt(1));
+
+    // Second row
+    try std.testing.expect(try stmt.step());
+    try std.testing.expectEqualStrings("Bob", stmt.columnText(0).?);
+    try std.testing.expectEqual(@as(i32, 25), stmt.columnInt(1));
+
+    // No more rows
+    try std.testing.expect(!try stmt.step());
+}
+
+test "prepareDynamic works with runtime string" {
+    const allocator = std.testing.allocator;
+
+    var db = try Db.open(":memory:", .{});
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE test (value TEXT)");
+    try db.exec("INSERT INTO test VALUES ('hello')");
+
+    const table_name = "test";
+    const sql = try std.fmt.allocPrint(allocator, "SELECT value FROM {s}", .{table_name});
+    defer allocator.free(sql);
+
+    var stmt = try db.prepareDynamic(allocator, sql);
+    defer stmt.deinit();
+
+    try std.testing.expect(try stmt.step());
+    try std.testing.expectEqualStrings("hello", stmt.columnText(0).?);
+}
+
+test "bindText and bindNull" {
+    var db = try Db.open(":memory:", .{});
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT)");
+
+    var insert = try db.prepare("INSERT INTO test (name) VALUES (?)");
+    defer insert.deinit();
+
+    // Insert with text
+    try insert.bindText(1, "Alice");
+    try insert.exec();
+
+    // Reset and insert with NULL
+    insert.reset();
+    try insert.bindNull(1);
+    try insert.exec();
+
+    // Verify
+    var select = try db.prepare("SELECT name FROM test ORDER BY id");
+    defer select.deinit();
+
+    try std.testing.expect(try select.step());
+    try std.testing.expectEqualStrings("Alice", select.columnText(0).?);
+
+    try std.testing.expect(try select.step());
+    try std.testing.expect(select.columnIsNull(0));
+    try std.testing.expect(select.columnText(0) == null);
+}
+
+test "columnTextAlloc duplicates string" {
+    const allocator = std.testing.allocator;
+
+    var db = try Db.open(":memory:", .{});
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE test (name TEXT)");
+    try db.exec("INSERT INTO test VALUES ('hello world')");
+
+    var stmt = try db.prepare("SELECT name FROM test");
+    defer stmt.deinit();
+
+    try std.testing.expect(try stmt.step());
+
+    const text = try stmt.columnTextAlloc(allocator, 0);
+    defer if (text) |t| allocator.free(t);
+
+    try std.testing.expectEqualStrings("hello world", text.?);
+}
+
+test "columnInt64 for large values" {
+    var db = try Db.open(":memory:", .{});
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE test (big_num INTEGER)");
+    try db.exec("INSERT INTO test VALUES (9223372036854775807)"); // Max i64
+
+    var stmt = try db.prepare("SELECT big_num FROM test");
+    defer stmt.deinit();
+
+    try std.testing.expect(try stmt.step());
+    try std.testing.expectEqual(@as(i64, 9223372036854775807), stmt.columnInt64(0));
+}
+
+test "columnCount returns correct count" {
+    var db = try Db.open(":memory:", .{});
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE test (a INT, b INT, c INT, d INT)");
+
+    var stmt = try db.prepare("SELECT a, b, c, d FROM test");
+    defer stmt.deinit();
+
+    try std.testing.expectEqual(@as(c_int, 4), stmt.columnCount());
+}
+
+test "getErrorMessage returns meaningful message" {
+    var db = try Db.open(":memory:", .{});
+    defer db.deinit();
+
+    // Cause an error
+    _ = db.exec("INVALID") catch {};
+
+    const msg = db.getErrorMessage();
+    try std.testing.expect(msg.len > 0);
+    try std.testing.expect(!std.mem.eql(u8, msg, "unknown error"));
+}
+
+test "constraint violation returns SqliteConstraint" {
+    var db = try Db.open(":memory:", .{});
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE test (id INTEGER PRIMARY KEY)");
+    try db.exec("INSERT INTO test VALUES (1)");
+
+    const result = db.exec("INSERT INTO test VALUES (1)"); // Duplicate primary key
+    try std.testing.expectError(Error.SqliteConstraint, result);
+}
+
+test "statement reset allows re-execution" {
+    var db = try Db.open(":memory:", .{});
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE test (id INTEGER)");
+    try db.exec("INSERT INTO test VALUES (1), (2), (3)");
+
+    var stmt = try db.prepare("SELECT id FROM test");
+    defer stmt.deinit();
+
+    // First iteration
+    var count: usize = 0;
+    while (try stmt.step()) {
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), count);
+
+    // Reset and iterate again
+    stmt.reset();
+    count = 0;
+    while (try stmt.step()) {
+        count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), count);
+}
+
+test "empty string column" {
+    var db = try Db.open(":memory:", .{});
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE test (name TEXT)");
+    try db.exec("INSERT INTO test VALUES ('')");
+
+    var stmt = try db.prepare("SELECT name FROM test");
+    defer stmt.deinit();
+
+    try std.testing.expect(try stmt.step());
+    try std.testing.expect(!stmt.columnIsNull(0));
+    try std.testing.expectEqualStrings("", stmt.columnText(0).?);
+}
+
+test "unicode text" {
+    var db = try Db.open(":memory:", .{});
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE test (name TEXT)");
+
+    var insert = try db.prepare("INSERT INTO test VALUES (?)");
+    defer insert.deinit();
+
+    const unicode_text = "Hello 世界 🌍 émoji";
+    try insert.bindText(1, unicode_text);
+    try insert.exec();
+
+    var select = try db.prepare("SELECT name FROM test");
+    defer select.deinit();
+
+    try std.testing.expect(try select.step());
+    try std.testing.expectEqualStrings(unicode_text, select.columnText(0).?);
+}

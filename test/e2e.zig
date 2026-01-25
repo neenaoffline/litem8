@@ -776,3 +776,369 @@ test "e2e: hash stored in migrations table" {
     try std.testing.expect(hash != null);
     try std.testing.expectEqual(@as(usize, 64), hash.?.len); // SHA256 = 64 hex chars
 }
+
+// ============================================================================
+// Edge Case Tests
+// ============================================================================
+
+test "e2e: empty migration file (0 bytes)" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    // Create an empty migration file
+    try tmp.writeMigration("001_empty.sql", "");
+
+    var result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result.deinit();
+
+    // Empty migrations should succeed (nothing to do)
+    try std.testing.expectEqual(@as(?u8, 0), result.exitCode());
+}
+
+test "e2e: migration with only whitespace" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    try tmp.writeMigration("001_whitespace.sql", "   \n\t\n   \n");
+
+    var result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 0), result.exitCode());
+}
+
+test "e2e: migration with only SQL comments" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    try tmp.writeMigration("001_comments.sql",
+        \\-- This is a comment
+        \\-- Another comment
+        \\/* Block comment */
+    );
+
+    var result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result.deinit();
+
+    // Comments-only should succeed
+    try std.testing.expectEqual(@as(?u8, 0), result.exitCode());
+}
+
+test "e2e: migration with unicode content" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    try tmp.writeMigration("001_unicode.sql",
+        \\CREATE TABLE users (
+        \\    id INTEGER PRIMARY KEY,
+        \\    name TEXT NOT NULL
+        \\);
+        \\-- Комментарий на русском
+        \\INSERT INTO users (name) VALUES ('世界');
+        \\INSERT INTO users (name) VALUES ('émoji 🎉');
+    );
+
+    var result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 0), result.exitCode());
+
+    // Verify unicode data was inserted correctly
+    var db = try openDb(allocator, tmp.db_path);
+    defer db.deinit();
+
+    var stmt = try db.prepare("SELECT name FROM users ORDER BY id");
+    defer stmt.deinit();
+
+    try std.testing.expect(try stmt.step());
+    try std.testing.expectEqualStrings("世界", stmt.columnText(0).?);
+
+    try std.testing.expect(try stmt.step());
+    try std.testing.expectEqualStrings("émoji 🎉", stmt.columnText(0).?);
+}
+
+test "e2e: SQL injection attempt in --table parameter" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    try tmp.writeMigration("001_test.sql",
+        \\CREATE TABLE test (id INTEGER);
+    );
+
+    // Attempt SQL injection via table name
+    var result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+        "--table",
+        "migrations; DROP TABLE test; --",
+    });
+    defer result.deinit();
+
+    // The command might fail due to invalid table name, which is fine
+    // The important thing is it doesn't execute the DROP TABLE
+
+    // If it succeeded, verify 'test' table still exists
+    if (result.exitCode() == 0) {
+        var db = try openDb(allocator, tmp.db_path);
+        defer db.deinit();
+
+        try std.testing.expect(try tableExists(allocator, &db, "test"));
+    }
+}
+
+test "e2e: very long migration filename" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    // Create a migration with a very long name (but valid)
+    const long_name = "001_" ++ "a" ** 200 ++ ".sql";
+    try tmp.writeMigration(long_name,
+        \\CREATE TABLE test (id INTEGER);
+    );
+
+    var result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 0), result.exitCode());
+}
+
+test "e2e: migration number with many leading zeros" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    try tmp.writeMigration("00000001_test.sql",
+        \\CREATE TABLE test1 (id INTEGER);
+    );
+    try tmp.writeMigration("00000002_test.sql",
+        \\CREATE TABLE test2 (id INTEGER);
+    );
+
+    var result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 0), result.exitCode());
+
+    var db = try openDb(allocator, tmp.db_path);
+    defer db.deinit();
+
+    try std.testing.expect(try tableExists(allocator, &db, "test1"));
+    try std.testing.expect(try tableExists(allocator, &db, "test2"));
+}
+
+test "e2e: migration with multiple statements and error in middle" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    try tmp.writeMigration("001_multi_error.sql",
+        \\CREATE TABLE before_error (id INTEGER);
+        \\INVALID SQL HERE;
+        \\CREATE TABLE after_error (id INTEGER);
+    );
+
+    var result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result.deinit();
+
+    // Should fail
+    try std.testing.expectEqual(@as(?u8, 1), result.exitCode());
+
+    // Transaction should have rolled back - before_error should NOT exist
+    var db = try openDb(allocator, tmp.db_path);
+    defer db.deinit();
+
+    try std.testing.expect(!try tableExists(allocator, &db, "before_error"));
+    try std.testing.expect(!try tableExists(allocator, &db, "after_error"));
+}
+
+test "e2e: migration creates and drops same table" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    try tmp.writeMigration("001_create_drop.sql",
+        \\CREATE TABLE temp_table (id INTEGER);
+        \\DROP TABLE temp_table;
+    );
+
+    var result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 0), result.exitCode());
+
+    // Table should not exist after migration
+    var db = try openDb(allocator, tmp.db_path);
+    defer db.deinit();
+
+    try std.testing.expect(!try tableExists(allocator, &db, "temp_table"));
+}
+
+test "e2e: running up twice is idempotent" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    try tmp.writeMigration("001_test.sql",
+        \\CREATE TABLE test (id INTEGER);
+    );
+
+    // Run once
+    var result1 = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result1.deinit();
+    try std.testing.expectEqual(@as(?u8, 0), result1.exitCode());
+
+    // Run again - should succeed with "up to date" message
+    var result2 = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result2.deinit();
+    try std.testing.expectEqual(@as(?u8, 0), result2.exitCode());
+    try std.testing.expect(containsString(result2.stderr, "up to date"));
+}
+
+test "e2e: non-sql files in migrations directory are ignored" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    try tmp.writeMigration("001_real.sql",
+        \\CREATE TABLE real_table (id INTEGER);
+    );
+    try tmp.writeMigration("README.md", "# This is not a migration");
+    try tmp.writeMigration("notes.txt", "Some notes");
+    try tmp.writeMigration(".hidden", "hidden file");
+
+    var result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 0), result.exitCode());
+
+    // Should only have run 1 migration
+    try std.testing.expect(containsString(result.stderr, "1 pending") or
+        containsString(result.stderr, "1 migration"));
+
+    var db = try openDb(allocator, tmp.db_path);
+    defer db.deinit();
+
+    try std.testing.expect(try tableExists(allocator, &db, "real_table"));
+}
+
+test "e2e: large migration number" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    try tmp.writeMigration("999999999_big_number.sql",
+        \\CREATE TABLE big_number_test (id INTEGER);
+    );
+
+    var result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 0), result.exitCode());
+}
+
+test "e2e: status on empty migrations directory" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    // Create db first
+    {
+        const path_z = try allocator.dupeZ(u8, tmp.db_path);
+        defer allocator.free(path_z);
+        var db = try sqlite.Db.open(path_z, .{ .write = true, .create = true });
+        db.deinit();
+    }
+
+    // Run status with empty migrations dir
+    var result = try runLitem8(allocator, &.{
+        "status",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 0), result.exitCode());
+}
