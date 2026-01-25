@@ -1,0 +1,107 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64
+          - os: ubuntu-latest
+            name: Linux x86_64
+          # macOS x86_64
+          - os: macos-13
+            name: macOS x86_64
+          # macOS ARM64 (Apple Silicon)
+          - os: macos-14
+            name: macOS ARM64
+          # Windows x86_64
+          - os: windows-latest
+            name: Windows x86_64
+
+    name: Test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build
+        run: zig build
+
+      - name: Run unit tests
+        run: zig build test
+
+      - name: Verify binary runs
+        shell: bash
+        run: |
+          ./zig-out/bin/litem8 --help || ./zig-out/bin/litem8.exe --help
+
+  # Test cross-compilation works (doesn't run the binaries, just builds them)
+  cross-compile:
+    name: Cross-compile check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build all release targets
+        run: zig build release
+
+      - name: Verify all binaries exist
+        run: |
+          test -f zig-out/x86_64-linux-musl-static/litem8
+          test -f zig-out/aarch64-linux-musl-static/litem8
+          test -f zig-out/arm-linux-musl-static/litem8
+          test -f zig-out/riscv64-linux-musl-static/litem8
+          test -f zig-out/x86_64-macos/litem8
+          test -f zig-out/aarch64-macos/litem8
+          test -f zig-out/x86_64-windows/litem8.exe
+          test -f zig-out/aarch64-windows/litem8.exe
+          echo "All 8 release binaries built successfully"
+
+  # Test Linux ARM64 via QEMU
+  test-linux-arm64:
+    name: Test (Linux ARM64 via QEMU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Run tests in ARM64 container
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v ${{ github.workspace }}:/build \
+            -w /build \
+            debian:bookworm-slim \
+            bash -c '
+              apt-get update && apt-get install -y curl xz-utils
+              
+              # Install Zig
+              curl -fsSL "https://ziglang.org/download/0.15.2/zig-linux-aarch64-0.15.2.tar.xz" -o /tmp/zig.tar.xz
+              tar -xJf /tmp/zig.tar.xz -C /opt
+              export PATH="/opt/zig-linux-aarch64-0.15.2:$PATH"
+              
+              # Build and test
+              zig build
+              zig build test
+              ./zig-out/bin/litem8 --help
+              
+              echo "Linux ARM64 tests passed!"
+            '
