@@ -11,6 +11,7 @@ pub const Error = error{
     SqliteConstraint,
     SqliteBusy,
     SqliteCorrupt,
+    InvalidSql,
     OutOfMemory,
 };
 
@@ -78,6 +79,10 @@ pub const Db = struct {
 
     /// Execute multiple SQL statements (semicolon separated)
     pub fn execMulti(self: *Db, sql: []const u8) Error!void {
+        if (std.mem.indexOfScalar(u8, sql, 0) != null) {
+            return Error.InvalidSql;
+        }
+
         // sqlite3_exec requires null-terminated string
         var buf: [64 * 1024]u8 = undefined;
         if (sql.len >= buf.len) {

@@ -146,15 +146,10 @@ fn tableExists(allocator: Allocator, db: *sqlite.Db, table_name: []const u8) !bo
     const query = try allocator.dupeZ(u8, query_slice);
     defer allocator.free(query);
 
-    var stmt = db.prepare(query) catch {
-        return false;
-    };
+    var stmt = try db.prepare(query);
     defer stmt.deinit();
 
-    const has_row = stmt.step() catch {
-        return false;
-    };
-    return has_row;
+    return try stmt.step();
 }
 
 fn getRecordedMigrations(allocator: Allocator, db: *sqlite.Db, table_name: []const u8) ![][]const u8 {
@@ -883,6 +878,38 @@ test "e2e: migration with unicode content" {
 
     try std.testing.expect(try stmt.step());
     try std.testing.expectEqualStrings("émoji 🎉", stmt.columnText(0).?);
+}
+
+test "e2e: migration with embedded NUL is rejected without recording" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    try tmp.writeMigration(
+        "001_embedded_nul.sql",
+        "CREATE TABLE before_nul (id INTEGER);\x00CREATE TABLE after_nul (id INTEGER);",
+    );
+
+    var result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 1), result.exitCode());
+
+    var db = try openDb(allocator, tmp.db_path);
+    defer db.deinit();
+
+    try std.testing.expect(!try tableExists(allocator, &db, "before_nul"));
+    try std.testing.expect(!try tableExists(allocator, &db, "after_nul"));
+
+    const migrations = try getRecordedMigrations(allocator, &db, "schema_migrations");
+    defer allocator.free(migrations);
+    try std.testing.expectEqual(@as(usize, 0), migrations.len);
 }
 
 test "e2e: SQL injection attempt in --table parameter" {
