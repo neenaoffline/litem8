@@ -460,6 +460,72 @@ test "e2e: up - invalid SQL rollback" {
     try std.testing.expectEqual(@as(usize, 1), migrations.len);
 }
 
+test "e2e: migration cannot rollback runner transaction" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    try tmp.writeMigration(
+        "001_rollback.sql",
+        "CREATE TABLE rolled_back (id INTEGER); ROLLBACK;",
+    );
+
+    var result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 1), result.exitCode());
+
+    var db = try openDb(allocator, tmp.db_path);
+    defer db.deinit();
+    try std.testing.expect(!try tableExists(allocator, &db, "rolled_back"));
+
+    const migrations = try getRecordedMigrations(allocator, &db, "schema_migrations");
+    defer {
+        for (migrations) |migration| allocator.free(migration);
+        allocator.free(migrations);
+    }
+    try std.testing.expectEqual(@as(usize, 0), migrations.len);
+}
+
+test "e2e: migration cannot commit runner transaction" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    try tmp.writeMigration(
+        "001_commit.sql",
+        "CREATE TABLE committed_early (id INTEGER); COMMIT;",
+    );
+
+    var result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 1), result.exitCode());
+
+    var db = try openDb(allocator, tmp.db_path);
+    defer db.deinit();
+    try std.testing.expect(!try tableExists(allocator, &db, "committed_early"));
+
+    const migrations = try getRecordedMigrations(allocator, &db, "schema_migrations");
+    defer {
+        for (migrations) |migration| allocator.free(migration);
+        allocator.free(migrations);
+    }
+    try std.testing.expectEqual(@as(usize, 0), migrations.len);
+}
+
 test "e2e: status - no database" {
     const allocator = std.testing.allocator;
     var tmp = try TempDir.init(allocator);

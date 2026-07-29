@@ -6,6 +6,20 @@ const c = @cImport({
 
 const Allocator = std.mem.Allocator;
 
+fn migrationAuthorizer(
+    _: ?*anyopaque,
+    action_code: c_int,
+    _: [*c]const u8,
+    _: [*c]const u8,
+    _: [*c]const u8,
+    _: [*c]const u8,
+) callconv(.c) c_int {
+    if (action_code == c.SQLITE_TRANSACTION or action_code == c.SQLITE_SAVEPOINT) {
+        return c.SQLITE_DENY;
+    }
+    return c.SQLITE_OK;
+}
+
 pub const Error = error{
     SqliteError,
     SqliteConstraint,
@@ -99,6 +113,17 @@ pub const Db = struct {
         if (rc != c.SQLITE_OK) {
             return mapError(rc);
         }
+    }
+
+    /// Execute migration SQL without allowing it to control the surrounding transaction.
+    pub fn execMigration(self: *Db, sql: []const u8) Error!void {
+        const rc = c.sqlite3_set_authorizer(self.handle, migrationAuthorizer, null);
+        if (rc != c.SQLITE_OK) {
+            return mapError(rc);
+        }
+        defer _ = c.sqlite3_set_authorizer(self.handle, null, null);
+
+        try self.execMulti(sql);
     }
 
     /// Prepare a statement
@@ -311,6 +336,47 @@ test "execMulti with SQL too large returns error" {
     const large_sql = "SELECT 1;" ** 10000;
     const result = db.execMulti(large_sql);
     try std.testing.expectError(Error.OutOfMemory, result);
+}
+
+test "execMigration denies transaction control and restores the authorizer" {
+    var db = try Db.open(":memory:", .{});
+    defer db.deinit();
+
+    try db.exec("BEGIN TRANSACTION");
+    try std.testing.expectError(Error.SqliteError, db.execMigration("ROLLBACK"));
+    try std.testing.expectEqual(@as(c_int, 0), c.sqlite3_get_autocommit(db.handle));
+    try db.exec("ROLLBACK");
+
+    try db.exec("BEGIN TRANSACTION");
+    try std.testing.expectError(Error.SqliteError, db.execMigration("SAVEPOINT nested"));
+    try std.testing.expectEqual(@as(c_int, 0), c.sqlite3_get_autocommit(db.handle));
+    try db.exec("ROLLBACK");
+
+    try db.exec("BEGIN TRANSACTION");
+    try db.exec("COMMIT");
+    try std.testing.expectEqual(@as(c_int, 1), c.sqlite3_get_autocommit(db.handle));
+}
+
+test "execMigration surfaces automatic rollback and leaves no partial changes" {
+    var db = try Db.open(":memory:", .{});
+    defer db.deinit();
+
+    try db.exec("CREATE TABLE unique_values (value INTEGER UNIQUE)");
+    try db.exec("BEGIN TRANSACTION");
+    try std.testing.expectError(
+        Error.SqliteConstraint,
+        db.execMigration(
+            \\INSERT INTO unique_values VALUES (1);
+            \\INSERT OR ROLLBACK INTO unique_values VALUES (1);
+        ),
+    );
+
+    try std.testing.expectEqual(@as(c_int, 1), c.sqlite3_get_autocommit(db.handle));
+
+    var stmt = try db.prepare("SELECT COUNT(*) FROM unique_values");
+    defer stmt.deinit();
+    try std.testing.expect(try stmt.step());
+    try std.testing.expectEqual(@as(i32, 0), stmt.columnInt(0));
 }
 
 test "prepare and execute SELECT" {

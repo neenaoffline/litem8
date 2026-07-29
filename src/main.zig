@@ -455,8 +455,8 @@ fn executeMigration(allocator: Allocator, db: *sqlite.Db, migration: Migration, 
         db.exec("ROLLBACK") catch {};
     }
 
-    // Execute migration SQL using execMulti for multi-statement support
-    db.execMulti(sql) catch |err| {
+    // Execute migration SQL without allowing it to control this transaction.
+    db.execMigration(sql) catch |err| {
         std.debug.print("Error executing migration {s}: {}\n", .{ migration.name, err });
         std.debug.print("SQLite error: {s}\n", .{db.getErrorMessage()});
         db.exec("ROLLBACK") catch {};
