@@ -149,6 +149,16 @@ const ParseResult = union(enum) {
     err,
 };
 
+fn isValidTableName(name: []const u8) bool {
+    if (name.len == 0) return false;
+    if (!std.ascii.isAlphabetic(name[0]) and name[0] != '_') return false;
+
+    for (name[1..]) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '_') return false;
+    }
+    return true;
+}
+
 fn parseArgs(allocator: Allocator) !ParseResult {
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
@@ -206,6 +216,11 @@ fn parseArgs(allocator: Allocator) !ParseResult {
     if (migrations_path == null) {
         std.debug.print("Error: --migrations is required\n\n", .{});
         printUsage();
+        return .err;
+    }
+
+    if (!isValidTableName(table_name)) {
+        std.debug.print("Error: Invalid table name '{s}'\n", .{table_name});
         return .err;
     }
 
@@ -336,39 +351,96 @@ fn openDatabase(allocator: Allocator, db_path: []const u8, flags: sqlite.OpenFla
     };
 }
 
-fn createMigrationsTable(allocator: Allocator, db: *sqlite.Db, table_name: []const u8) !void {
-    // Build CREATE TABLE statement
-    const create_sql_slice = std.fmt.allocPrint(
-        allocator,
-        "CREATE TABLE IF NOT EXISTS {s} (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, run_at TEXT NOT NULL, hash TEXT)",
-        .{table_name},
-    ) catch return MigrationError.DatabaseError;
-    defer allocator.free(create_sql_slice);
-    const create_sql = allocator.dupeZ(u8, create_sql_slice) catch return MigrationError.DatabaseError;
-    defer allocator.free(create_sql);
+const MigrationsTableState = enum {
+    missing,
+    legacy,
+    current,
+};
 
-    db.exec(create_sql) catch {
+fn getMigrationsTableState(allocator: Allocator, db: *sqlite.Db, table_name: []const u8) !MigrationsTableState {
+    var exists_stmt = db.prepare(
+        "SELECT name, sql FROM main.sqlite_master WHERE type='table' AND name=? COLLATE NOCASE",
+    ) catch {
+        return MigrationError.DatabaseError;
+    };
+    defer exists_stmt.deinit();
+    exists_stmt.bindText(1, table_name) catch return MigrationError.DatabaseError;
+    if (!(exists_stmt.step() catch return MigrationError.DatabaseError)) return .missing;
+
+    const actual_name = exists_stmt.columnText(0) orelse return MigrationError.DatabaseError;
+    const stored_sql = exists_stmt.columnText(1) orelse return MigrationError.DatabaseError;
+    const legacy_unquoted = std.fmt.allocPrint(
+        allocator,
+        "CREATE TABLE {s} (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, run_at TEXT NOT NULL)",
+        .{actual_name},
+    ) catch return MigrationError.DatabaseError;
+    defer allocator.free(legacy_unquoted);
+    const legacy_quoted = std.fmt.allocPrint(
+        allocator,
+        "CREATE TABLE \"{s}\" (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, run_at TEXT NOT NULL)",
+        .{actual_name},
+    ) catch return MigrationError.DatabaseError;
+    defer allocator.free(legacy_quoted);
+    const current_unquoted = std.fmt.allocPrint(
+        allocator,
+        "CREATE TABLE {s} (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, run_at TEXT NOT NULL, hash TEXT)",
+        .{actual_name},
+    ) catch return MigrationError.DatabaseError;
+    defer allocator.free(current_unquoted);
+    const current_quoted = std.fmt.allocPrint(
+        allocator,
+        "CREATE TABLE \"{s}\" (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, run_at TEXT NOT NULL, hash TEXT)",
+        .{actual_name},
+    ) catch return MigrationError.DatabaseError;
+    defer allocator.free(current_quoted);
+
+    const state: MigrationsTableState = if (std.mem.eql(u8, stored_sql, legacy_unquoted) or std.mem.eql(u8, stored_sql, legacy_quoted))
+        .legacy
+    else if (std.mem.eql(u8, stored_sql, current_unquoted) or std.mem.eql(u8, stored_sql, current_quoted))
+        .current
+    else {
+        std.debug.print("Error: Existing table '{s}' is not a compatible migrations table\n", .{table_name});
         return MigrationError.DatabaseError;
     };
 
-    // Add hash column if it doesn't exist (for existing databases)
-    const alter_sql_slice = std.fmt.allocPrint(
-        allocator,
-        "ALTER TABLE {s} ADD COLUMN hash TEXT",
-        .{table_name},
+    var extension_stmt = db.prepare(
+        "SELECT 1 FROM main.sqlite_master WHERE tbl_name=? COLLATE NOCASE AND " ++
+            "(type='trigger' OR (type='index' AND sql IS NOT NULL)) LIMIT 1",
     ) catch return MigrationError.DatabaseError;
-    defer allocator.free(alter_sql_slice);
-    const alter_sql = allocator.dupeZ(u8, alter_sql_slice) catch return MigrationError.DatabaseError;
-    defer allocator.free(alter_sql);
+    defer extension_stmt.deinit();
+    extension_stmt.bindText(1, actual_name) catch return MigrationError.DatabaseError;
+    if (extension_stmt.step() catch return MigrationError.DatabaseError) {
+        std.debug.print("Error: Existing table '{s}' has unsupported triggers or indexes\n", .{table_name});
+        return MigrationError.DatabaseError;
+    }
 
-    // Ignore error if column already exists
-    db.exec(alter_sql) catch {};
+    return state;
+}
+
+fn createMigrationsTable(allocator: Allocator, db: *sqlite.Db, table_name: []const u8) !void {
+    const state = try getMigrationsTableState(allocator, db, table_name);
+    if (state == .current) return;
+
+    const sql_slice = switch (state) {
+        .missing => std.fmt.allocPrint(
+            allocator,
+            "CREATE TABLE main.\"{s}\" (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, run_at TEXT NOT NULL, hash TEXT)",
+            .{table_name},
+        ),
+        .legacy => std.fmt.allocPrint(allocator, "ALTER TABLE main.\"{s}\" ADD COLUMN hash TEXT", .{table_name}),
+        .current => unreachable,
+    } catch return MigrationError.DatabaseError;
+    defer allocator.free(sql_slice);
+    const sql = allocator.dupeZ(u8, sql_slice) catch return MigrationError.DatabaseError;
+    defer allocator.free(sql);
+
+    db.exec(sql) catch return MigrationError.DatabaseError;
 }
 
 fn getRunMigrations(allocator: Allocator, db: *sqlite.Db, table_name: []const u8) ![]RunMigration {
     const query = std.fmt.allocPrint(
         allocator,
-        "SELECT name, run_at, hash FROM {s} ORDER BY id",
+        "SELECT name, run_at, hash FROM main.\"{s}\" ORDER BY id",
         .{table_name},
     ) catch return MigrationError.DatabaseError;
     defer allocator.free(query);
@@ -466,17 +538,20 @@ fn executeMigration(allocator: Allocator, db: *sqlite.Db, migration: Migration, 
     // Get current timestamp
     const timestamp = getTimestamp();
 
-    // Record migration with hash
-    const insert_sql_slice = std.fmt.allocPrint(
-        std.heap.page_allocator,
-        "INSERT INTO {s} (name, run_at, hash) VALUES ('{s}', '{s}', '{s}')",
-        .{ table_name, migration.name, timestamp, hash },
+    // Record migration with bound values. The table name was validated during argument parsing.
+    const insert_sql = std.fmt.allocPrint(
+        allocator,
+        "INSERT INTO main.\"{s}\" (name, run_at, hash) VALUES (?, ?, ?)",
+        .{table_name},
     ) catch return MigrationError.SqlExecutionError;
-    defer std.heap.page_allocator.free(insert_sql_slice);
-    const insert_sql = std.heap.page_allocator.dupeZ(u8, insert_sql_slice) catch return MigrationError.SqlExecutionError;
-    defer std.heap.page_allocator.free(insert_sql);
+    defer allocator.free(insert_sql);
 
-    db.exec(insert_sql) catch {
+    var insert_stmt = db.prepareDynamic(allocator, insert_sql) catch return MigrationError.SqlExecutionError;
+    defer insert_stmt.deinit();
+    insert_stmt.bindText(1, migration.name) catch return MigrationError.SqlExecutionError;
+    insert_stmt.bindText(2, timestamp) catch return MigrationError.SqlExecutionError;
+    insert_stmt.bindText(3, hash) catch return MigrationError.SqlExecutionError;
+    insert_stmt.exec() catch {
         db.exec("ROLLBACK") catch {};
         return MigrationError.SqlExecutionError;
     };
@@ -611,19 +686,13 @@ fn runStatus(allocator: Allocator, config: Config) !void {
     defer db.deinit();
 
     // Check if migrations table exists
-    const check_sql_slice = std.fmt.allocPrint(
-        allocator,
-        "SELECT name FROM sqlite_master WHERE type='table' AND name='{s}'",
-        .{config.table_name},
-    ) catch return MigrationError.DatabaseError;
-    defer allocator.free(check_sql_slice);
-    const check_sql = allocator.dupeZ(u8, check_sql_slice) catch return MigrationError.DatabaseError;
-    defer allocator.free(check_sql);
-
-    var check_stmt = db.prepare(check_sql) catch {
+    var check_stmt = db.prepare(
+        "SELECT name FROM main.sqlite_master WHERE type='table' AND name=? COLLATE NOCASE",
+    ) catch {
         return MigrationError.DatabaseError;
     };
     defer check_stmt.deinit();
+    check_stmt.bindText(1, config.table_name) catch return MigrationError.DatabaseError;
 
     const table_exists = (check_stmt.step() catch {
         return MigrationError.DatabaseError;
@@ -702,4 +771,19 @@ test "parseMigrationNumber invalid cases" {
     try std.testing.expectError(MigrationError.InvalidFilenameFormat, parseMigrationNumber("1_init.txt"));
     try std.testing.expectError(MigrationError.InvalidFilenameFormat, parseMigrationNumber("abc_init.sql"));
     try std.testing.expectError(MigrationError.InvalidFilenameFormat, parseMigrationNumber("1a_init.sql"));
+}
+
+test "table name validation accepts conservative SQLite identifiers" {
+    try std.testing.expect(isValidTableName("schema_migrations"));
+    try std.testing.expect(isValidTableName("_migrations2"));
+    try std.testing.expect(isValidTableName("Migrations"));
+}
+
+test "table name validation rejects unsafe identifiers" {
+    try std.testing.expect(!isValidTableName(""));
+    try std.testing.expect(!isValidTableName("1migrations"));
+    try std.testing.expect(!isValidTableName("schema migrations"));
+    try std.testing.expect(!isValidTableName("schema-migrations"));
+    try std.testing.expect(!isValidTableName("migrations; DROP TABLE users"));
+    try std.testing.expect(!isValidTableName("migratiöns"));
 }

@@ -141,13 +141,10 @@ fn openDb(allocator: Allocator, db_path: []const u8) !sqlite.Db {
 }
 
 fn tableExists(allocator: Allocator, db: *sqlite.Db, table_name: []const u8) !bool {
-    const query_slice = try std.fmt.allocPrint(allocator, "SELECT name FROM sqlite_master WHERE type='table' AND name='{s}'", .{table_name});
-    defer allocator.free(query_slice);
-    const query = try allocator.dupeZ(u8, query_slice);
-    defer allocator.free(query);
-
-    var stmt = try db.prepare(query);
+    _ = allocator;
+    var stmt = try db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name=?");
     defer stmt.deinit();
+    try stmt.bindText(1, table_name);
 
     return try stmt.step();
 }
@@ -983,11 +980,20 @@ test "e2e: SQL injection attempt in --table parameter" {
     var tmp = try TempDir.init(allocator);
     defer tmp.cleanup();
 
+    const path_z = try allocator.dupeZ(u8, tmp.db_path);
+    defer allocator.free(path_z);
+    var setup_db = try sqlite.Db.open(path_z, .{ .write = true, .create = true });
+    try setup_db.exec("CREATE TABLE victim (id INTEGER)");
+    try setup_db.exec("INSERT INTO victim VALUES (42)");
+    setup_db.deinit();
+
+    const database_before = try std.fs.cwd().readFileAlloc(allocator, tmp.db_path, 1024 * 1024);
+    defer allocator.free(database_before);
+
     try tmp.writeMigration("001_test.sql",
         \\CREATE TABLE test (id INTEGER);
     );
 
-    // Attempt SQL injection via table name
     var result = try runLitem8(allocator, &.{
         "up",
         "--db",
@@ -995,20 +1001,232 @@ test "e2e: SQL injection attempt in --table parameter" {
         "--migrations",
         tmp.migrations_path,
         "--table",
-        "migrations; DROP TABLE test; --",
+        "track (id); DROP TABLE victim; --",
     });
     defer result.deinit();
 
-    // The command might fail due to invalid table name, which is fine
-    // The important thing is it doesn't execute the DROP TABLE
+    try std.testing.expectEqual(@as(?u8, 1), result.exitCode());
+    try std.testing.expect(containsString(result.stderr, "Invalid table name"));
 
-    // If it succeeded, verify 'test' table still exists
-    if (result.exitCode() == 0) {
-        var db = try openDb(allocator, tmp.db_path);
-        defer db.deinit();
+    const database_after = try std.fs.cwd().readFileAlloc(allocator, tmp.db_path, 1024 * 1024);
+    defer allocator.free(database_after);
+    try std.testing.expectEqualSlices(u8, database_before, database_after);
 
-        try std.testing.expect(try tableExists(allocator, &db, "test"));
+    var db = try openDb(allocator, tmp.db_path);
+    defer db.deinit();
+    try std.testing.expect(try tableExists(allocator, &db, "victim"));
+    try std.testing.expect(!try tableExists(allocator, &db, "track"));
+    try std.testing.expect(!try tableExists(allocator, &db, "test"));
+    try std.testing.expect(!try tableExists(allocator, &db, "schema_migrations"));
+
+    var sentinel = try db.prepare("SELECT id FROM victim");
+    defer sentinel.deinit();
+    try std.testing.expect(try sentinel.step());
+    try std.testing.expectEqual(@as(i32, 42), sentinel.columnInt(0));
+    try std.testing.expect(!try sentinel.step());
+}
+
+test "e2e: incompatible existing migration table is rejected without mutation" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    const path_z = try allocator.dupeZ(u8, tmp.db_path);
+    defer allocator.free(path_z);
+    var setup_db = try sqlite.Db.open(path_z, .{ .write = true, .create = true });
+    try setup_db.exec("CREATE TABLE victim (id INTEGER)");
+    try setup_db.exec("INSERT INTO victim VALUES (42)");
+    setup_db.deinit();
+
+    const database_before = try std.fs.cwd().readFileAlloc(allocator, tmp.db_path, 1024 * 1024);
+    defer allocator.free(database_before);
+
+    try tmp.writeMigration("001_test.sql",
+        \\CREATE TABLE test (id INTEGER);
+    );
+
+    var result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+        "--table",
+        "victim",
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 1), result.exitCode());
+
+    const database_after = try std.fs.cwd().readFileAlloc(allocator, tmp.db_path, 1024 * 1024);
+    defer allocator.free(database_after);
+    try std.testing.expectEqualSlices(u8, database_before, database_after);
+
+    var db = try openDb(allocator, tmp.db_path);
+    defer db.deinit();
+    try std.testing.expect(try tableExists(allocator, &db, "victim"));
+    try std.testing.expect(!try tableExists(allocator, &db, "test"));
+    try std.testing.expect(!try tableExists(allocator, &db, "schema_migrations"));
+}
+
+test "e2e: constrained table collision is rejected without mutation" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    const path_z = try allocator.dupeZ(u8, tmp.db_path);
+    defer allocator.free(path_z);
+    var setup_db = try sqlite.Db.open(path_z, .{ .write = true, .create = true });
+    try setup_db.exec(
+        "CREATE TABLE victim (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE CHECK(name='never'), run_at TEXT NOT NULL)",
+    );
+    setup_db.deinit();
+
+    const database_before = try std.fs.cwd().readFileAlloc(allocator, tmp.db_path, 1024 * 1024);
+    defer allocator.free(database_before);
+    try tmp.writeMigration("001_test.sql", "CREATE TABLE test (id INTEGER);");
+
+    var result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+        "--table",
+        "victim",
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 1), result.exitCode());
+    const database_after = try std.fs.cwd().readFileAlloc(allocator, tmp.db_path, 1024 * 1024);
+    defer allocator.free(database_after);
+    try std.testing.expectEqualSlices(u8, database_before, database_after);
+}
+
+test "e2e: compatible legacy migration table gains hash column" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    const path_z = try allocator.dupeZ(u8, tmp.db_path);
+    defer allocator.free(path_z);
+    var setup_db = try sqlite.Db.open(path_z, .{ .write = true, .create = true });
+    try setup_db.exec(
+        "CREATE TABLE Legacy_Migrations (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, run_at TEXT NOT NULL)",
+    );
+    setup_db.deinit();
+
+    try tmp.writeMigration("001_test.sql",
+        \\CREATE TABLE legacy_upgrade_test (id INTEGER);
+    );
+
+    var result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+        "--table",
+        "legacy_migrations",
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 0), result.exitCode());
+
+    var db = try openDb(allocator, tmp.db_path);
+    defer db.deinit();
+    var columns = try db.prepare("PRAGMA table_info(legacy_migrations)");
+    defer columns.deinit();
+    var found_hash = false;
+    while (try columns.step()) {
+        if (columns.columnText(1)) |name| {
+            if (std.mem.eql(u8, name, "hash")) found_hash = true;
+        }
     }
+    try std.testing.expect(found_hash);
+
+    var second_result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+        "--table",
+        "legacy_migrations",
+    });
+    defer second_result.deinit();
+    try std.testing.expectEqual(@as(?u8, 0), second_result.exitCode());
+}
+
+test "e2e: temporary table cannot shadow migration metadata" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    try tmp.writeMigration("001_temp_shadow.sql",
+        \\CREATE TABLE payload (id INTEGER);
+        \\CREATE TEMP TABLE schema_migrations (
+        \\    id INTEGER PRIMARY KEY,
+        \\    name TEXT NOT NULL UNIQUE,
+        \\    run_at TEXT NOT NULL,
+        \\    hash TEXT
+        \\);
+    );
+
+    var result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 0), result.exitCode());
+    var db = try openDb(allocator, tmp.db_path);
+    defer db.deinit();
+    try std.testing.expect(try tableExists(allocator, &db, "payload"));
+
+    const migrations = try getRecordedMigrations(allocator, &db, "schema_migrations");
+    defer {
+        for (migrations) |migration| allocator.free(migration);
+        allocator.free(migrations);
+    }
+    try std.testing.expectEqual(@as(usize, 1), migrations.len);
+    try std.testing.expectEqualStrings("001_temp_shadow.sql", migrations[0]);
+}
+
+test "e2e: migration filename containing apostrophe is recorded safely" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    try tmp.writeMigration("001_owner's_table.sql",
+        \\CREATE TABLE quoted_filename (id INTEGER);
+    );
+
+    var result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 0), result.exitCode());
+
+    var db = try openDb(allocator, tmp.db_path);
+    defer db.deinit();
+    try std.testing.expect(try tableExists(allocator, &db, "quoted_filename"));
+
+    const migrations = try getRecordedMigrations(allocator, &db, "schema_migrations");
+    defer {
+        for (migrations) |migration| allocator.free(migration);
+        allocator.free(migrations);
+    }
+    try std.testing.expectEqual(@as(usize, 1), migrations.len);
+    try std.testing.expectEqualStrings("001_owner's_table.sql", migrations[0]);
 }
 
 test "e2e: very long migration filename" {
