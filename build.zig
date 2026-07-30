@@ -177,7 +177,7 @@ pub fn build(b: *std.Build) void {
     e2e_tests.addIncludePath(b.path("deps/sqlite"));
     e2e_tests.linkLibC();
 
-    const exe_install_path = b.getInstallPath(.bin, "litem8");
+    const exe_install_path = b.getInstallPath(.bin, exe.out_filename);
     const options = b.addOptions();
     options.addOption([]const u8, "exe_path", exe_install_path);
     e2e_tests.root_module.addOptions("build_options", options);

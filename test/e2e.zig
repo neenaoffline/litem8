@@ -1,6 +1,7 @@
 const std = @import("std");
 const sqlite = @import("sqlite");
 const build_options = @import("build_options");
+const builtin = @import("builtin");
 
 const Allocator = std.mem.Allocator;
 
@@ -11,31 +12,18 @@ const Allocator = std.mem.Allocator;
 const TempDir = struct {
     allocator: Allocator,
     path: []const u8,
-    dir: std.fs.Dir,
+    tmp: std.testing.TmpDir,
     migrations_path: []const u8,
     db_path: []const u8,
 
     fn init(allocator: Allocator) !TempDir {
-        // Create unique temp directory
-        var buf: [256]u8 = undefined;
-        const timestamp = std.time.nanoTimestamp();
-        const rand = std.crypto.random.int(u32);
-        const dir_name = std.fmt.bufPrint(&buf, "litem8-test-{d}-{d}", .{ timestamp, rand }) catch unreachable;
-
-        const tmp_base = "/tmp";
-        const path = try std.fs.path.join(allocator, &.{ tmp_base, dir_name });
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const path = try tmp.dir.realpathAlloc(allocator, ".");
         errdefer allocator.free(path);
 
-        // Create the directory
-        std.fs.makeDirAbsolute(path) catch |err| {
-            std.debug.print("Failed to create temp dir {s}: {}\n", .{ path, err });
-            return err;
-        };
-
-        const dir = try std.fs.openDirAbsolute(path, .{});
-
         // Create migrations subdirectory
-        try dir.makeDir("migrations");
+        try tmp.dir.makeDir("migrations");
         const migrations_path = try std.fs.path.join(allocator, &.{ path, "migrations" });
         errdefer allocator.free(migrations_path);
 
@@ -44,24 +32,21 @@ const TempDir = struct {
         return TempDir{
             .allocator = allocator,
             .path = path,
-            .dir = dir,
+            .tmp = tmp,
             .migrations_path = migrations_path,
             .db_path = db_path,
         };
     }
 
     fn cleanup(self: *TempDir) void {
-        self.dir.close();
-        std.fs.deleteTreeAbsolute(self.path) catch |err| {
-            std.debug.print("Warning: failed to cleanup temp dir {s}: {}\n", .{ self.path, err });
-        };
+        self.tmp.cleanup();
         self.allocator.free(self.db_path);
         self.allocator.free(self.migrations_path);
         self.allocator.free(self.path);
     }
 
     fn writeMigration(self: *TempDir, name: []const u8, sql: []const u8) !void {
-        const migrations_dir = try self.dir.openDir("migrations", .{});
+        const migrations_dir = try self.tmp.dir.openDir("migrations", .{});
         var dir = migrations_dir;
         defer dir.close();
 
@@ -70,6 +55,14 @@ const TempDir = struct {
         try file.writeAll(sql);
     }
 };
+
+test "e2e: configured executable path uses the target suffix" {
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        build_options.exe_path,
+        builtin.target.exeFileExt(),
+    ));
+}
 
 const RunResult = struct {
     allocator: Allocator,
@@ -401,7 +394,7 @@ test "e2e: up - missing migrations directory" {
     defer tmp.cleanup();
 
     // Delete the migrations directory
-    try tmp.dir.deleteDir("migrations");
+    try tmp.tmp.dir.deleteDir("migrations");
 
     var result = try runLitem8(allocator, &.{
         "up",
@@ -619,6 +612,8 @@ test "e2e: --help flag" {
 
 test "e2e: missing required args" {
     const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
 
     // No arguments at all
     var result1 = try runLitem8(allocator, &.{});
@@ -629,7 +624,7 @@ test "e2e: missing required args" {
         containsString(result1.stderr, "Usage:"));
 
     // Missing --migrations
-    var result2 = try runLitem8(allocator, &.{ "up", "--db", "/tmp/test.db" });
+    var result2 = try runLitem8(allocator, &.{ "up", "--db", tmp.db_path });
     defer result2.deinit();
 
     try std.testing.expectEqual(@as(?u8, 1), result2.exitCode());
@@ -781,7 +776,7 @@ test "e2e: up - hash verification detects missing migration file" {
     try std.testing.expectEqual(@as(?u8, 0), result1.exitCode());
 
     // Delete the first migration file
-    const migrations_dir = try tmp.dir.openDir("migrations", .{});
+    const migrations_dir = try tmp.tmp.dir.openDir("migrations", .{});
     var dir = migrations_dir;
     defer dir.close();
     try dir.deleteFile("001_create_users.sql");
