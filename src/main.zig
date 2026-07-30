@@ -514,10 +514,6 @@ fn executeMigration(allocator: Allocator, db: *sqlite.Db, migration: Migration, 
 
     // Trim whitespace to avoid issues with empty statements
     const sql = std.mem.trim(u8, raw_sql, " \t\n\r");
-    if (sql.len == 0) {
-        // Empty migration file - nothing to do
-        return;
-    }
 
     // Begin transaction
     db.exec("BEGIN TRANSACTION") catch {

@@ -856,8 +856,28 @@ test "e2e: empty migration file (0 bytes)" {
     });
     defer result.deinit();
 
-    // Empty migrations should succeed (nothing to do)
     try std.testing.expectEqual(@as(?u8, 0), result.exitCode());
+
+    var second_result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer second_result.deinit();
+    try std.testing.expectEqual(@as(?u8, 0), second_result.exitCode());
+    try std.testing.expect(containsString(second_result.stderr, "All migrations are up to date."));
+
+    var db = try openDb(allocator, tmp.db_path);
+    defer db.deinit();
+    const migrations = try getRecordedMigrations(allocator, &db, "schema_migrations");
+    defer {
+        for (migrations) |migration| allocator.free(migration);
+        allocator.free(migrations);
+    }
+    try std.testing.expectEqual(@as(usize, 1), migrations.len);
+    try std.testing.expectEqualStrings("001_empty.sql", migrations[0]);
 }
 
 test "e2e: migration with only whitespace" {
@@ -877,6 +897,27 @@ test "e2e: migration with only whitespace" {
     defer result.deinit();
 
     try std.testing.expectEqual(@as(?u8, 0), result.exitCode());
+
+    var second_result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer second_result.deinit();
+    try std.testing.expectEqual(@as(?u8, 0), second_result.exitCode());
+    try std.testing.expect(containsString(second_result.stderr, "All migrations are up to date."));
+
+    var db = try openDb(allocator, tmp.db_path);
+    defer db.deinit();
+    const migrations = try getRecordedMigrations(allocator, &db, "schema_migrations");
+    defer {
+        for (migrations) |migration| allocator.free(migration);
+        allocator.free(migrations);
+    }
+    try std.testing.expectEqual(@as(usize, 1), migrations.len);
+    try std.testing.expectEqualStrings("001_whitespace.sql", migrations[0]);
 }
 
 test "e2e: migration with only SQL comments" {
