@@ -624,6 +624,24 @@ fn runUp(allocator: Allocator, config: Config) !void {
     };
 
     if (migrations.len == 0) {
+        std.fs.cwd().access(config.db_path, .{}) catch |err| {
+            if (err == error.FileNotFound) {
+                std.debug.print("No migration files found.\n", .{});
+                return;
+            }
+            return err;
+        };
+
+        var existing_db = try openDatabase(allocator, config.db_path, .{ .write = false, .create = false });
+        defer existing_db.deinit();
+        const table_state = try getMigrationsTableState(allocator, &existing_db, config.table_name);
+        if (table_state == .missing or table_state == .legacy) {
+            std.debug.print("No migration files found.\n", .{});
+            return;
+        }
+
+        const run_migrations = try getRunMigrations(allocator, &existing_db, config.table_name);
+        try verifyMigrationHashes(allocator, migrations, run_migrations);
         std.debug.print("No migration files found.\n", .{});
         return;
     }

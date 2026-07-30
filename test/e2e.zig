@@ -796,6 +796,50 @@ test "e2e: up - hash verification detects missing migration file" {
         containsString(result2.stderr, "no longer exists"));
 }
 
+test "e2e: up - deleting all applied migration files fails verification" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    try tmp.writeMigration("001_create_users.sql",
+        \\CREATE TABLE users (id INTEGER PRIMARY KEY);
+    );
+
+    var result1 = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result1.deinit();
+    try std.testing.expectEqual(@as(?u8, 0), result1.exitCode());
+
+    const database_before = try std.fs.cwd().readFileAlloc(allocator, tmp.db_path, 1024 * 1024);
+    defer allocator.free(database_before);
+
+    var migrations_dir = try tmp.tmp.dir.openDir("migrations", .{});
+    defer migrations_dir.close();
+    try migrations_dir.deleteFile("001_create_users.sql");
+
+    var result2 = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result2.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 1), result2.exitCode());
+    try std.testing.expect(containsString(result2.stderr, "missing") or
+        containsString(result2.stderr, "no longer exists"));
+
+    const database_after = try std.fs.cwd().readFileAlloc(allocator, tmp.db_path, 1024 * 1024);
+    defer allocator.free(database_after);
+    try std.testing.expectEqualSlices(u8, database_before, database_after);
+}
+
 test "e2e: hash stored in migrations table" {
     const allocator = std.testing.allocator;
     var tmp = try TempDir.init(allocator);
