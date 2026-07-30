@@ -20,6 +20,10 @@ fn migrationAuthorizer(
     return c.SQLITE_OK;
 }
 
+fn freeBoundText(value: ?*anyopaque) callconv(.c) void {
+    c.sqlite3_free(value);
+}
+
 pub const Error = error{
     SqliteError,
     SqliteConstraint,
@@ -181,7 +185,24 @@ pub const Statement = struct {
 
     /// Bind text parameter (1-indexed)
     pub fn bindText(self: *Statement, index: c_int, value: []const u8) Error!void {
-        const rc = c.sqlite3_bind_text(self.handle, index, value.ptr, @intCast(value.len), c.SQLITE_TRANSIENT);
+        if (value.len > std.math.maxInt(c_int)) {
+            return Error.OutOfMemory;
+        }
+
+        const allocation_size = std.math.add(usize, value.len, 1) catch return Error.OutOfMemory;
+        const raw_value = c.sqlite3_malloc64(@intCast(allocation_size)) orelse return Error.OutOfMemory;
+        const owned_value: [*]u8 = @ptrCast(raw_value);
+        @memcpy(owned_value[0..value.len], value);
+        owned_value[value.len] = 0;
+
+        // SQLite owns the copy after this call, including when binding fails.
+        const rc = c.sqlite3_bind_text(
+            self.handle,
+            index,
+            owned_value,
+            @intCast(value.len),
+            freeBoundText,
+        );
         if (rc != c.SQLITE_OK) {
             return Db.mapError(rc);
         }
@@ -380,6 +401,34 @@ test "execMigration surfaces automatic rollback and leaves no partial changes" {
     defer stmt.deinit();
     try std.testing.expect(try stmt.step());
     try std.testing.expectEqual(@as(i32, 0), stmt.columnInt(0));
+}
+
+test "bindText owns values through execution and rebinding" {
+    var db = try Db.open(":memory:", .{});
+    defer db.deinit();
+    try db.exec("CREATE TABLE bound_values (value TEXT)");
+
+    var insert = try db.prepare("INSERT INTO bound_values VALUES (?)");
+    defer insert.deinit();
+
+    var first = [_]u8{ 'f', 'i', 'r', 's', 't' };
+    try insert.bindText(1, &first);
+    @memset(&first, 'x');
+    try insert.exec();
+
+    insert.reset();
+    var second = [_]u8{ 's', 'e', 'c', 'o', 'n', 'd' };
+    try insert.bindText(1, &second);
+    @memset(&second, 'y');
+    try insert.exec();
+
+    var query = try db.prepare("SELECT value FROM bound_values ORDER BY rowid");
+    defer query.deinit();
+    try std.testing.expect(try query.step());
+    try std.testing.expectEqualStrings("first", query.columnText(0).?);
+    try std.testing.expect(try query.step());
+    try std.testing.expectEqualStrings("second", query.columnText(0).?);
+    try std.testing.expect(!try query.step());
 }
 
 test "prepare and execute SELECT" {

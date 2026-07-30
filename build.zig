@@ -148,6 +148,29 @@ pub fn build(b: *std.Build) void {
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
+    const sqlite_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/sqlite.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    if (bundle_sqlite) {
+        sqlite_test_mod.addIncludePath(b.path("deps/sqlite"));
+    }
+    const sqlite_tests = b.addTest(.{
+        .root_module = sqlite_test_mod,
+    });
+    if (bundle_sqlite) {
+        sqlite_tests.addCSourceFile(.{
+            .file = b.path("deps/sqlite/sqlite3.c"),
+            .flags = sqlite_cflags,
+        });
+        sqlite_tests.addIncludePath(b.path("deps/sqlite"));
+    } else {
+        sqlite_tests.root_module.linkSystemLibrary("sqlite3", .{});
+    }
+    sqlite_tests.linkLibC();
+    const run_sqlite_tests = b.addRunArtifact(sqlite_tests);
+
     // E2E tests
     const e2e_sqlite_mod = b.addModule("e2e_sqlite", .{
         .root_source_file = b.path("src/sqlite.zig"),
@@ -189,6 +212,7 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_sqlite_tests.step);
     test_step.dependOn(&run_e2e_tests.step);
 
     // =========================================================================
