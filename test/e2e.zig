@@ -530,9 +530,16 @@ test "e2e: status - no database" {
     });
     defer result.deinit();
 
-    // Should show error about missing database
+    try std.testing.expectEqual(@as(?u8, 1), result.exitCode());
     try std.testing.expect(containsString(result.stderr, "not found") or
         containsString(result.stderr, "Database"));
+    try std.testing.expect(!containsString(result.stderr, "error.FileNotFound"));
+    try std.testing.expect(!containsString(result.stderr, "main.main"));
+
+    try std.testing.expectError(
+        error.FileNotFound,
+        std.fs.cwd().access(tmp.db_path, .{}),
+    );
 }
 
 test "e2e: status - empty (no migrations run)" {

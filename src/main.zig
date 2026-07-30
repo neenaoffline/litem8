@@ -713,7 +713,7 @@ fn runStatus(allocator: Allocator, config: Config) !void {
     // Check if database exists
     std.fs.cwd().access(config.db_path, .{}) catch {
         std.debug.print("Error: Database file not found: {s}\n", .{config.db_path});
-        return;
+        return MigrationError.DatabaseError;
     };
 
     // Load migrations from directory (needed for hash verification)
