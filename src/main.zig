@@ -13,10 +13,39 @@ const Command = enum {
 };
 
 const Config = struct {
+    allocator: Allocator,
     db_path: []const u8,
     migrations_path: []const u8,
     table_name: []const u8,
     command: Command,
+
+    fn initOwned(
+        allocator: Allocator,
+        db_path: []const u8,
+        migrations_path: []const u8,
+        table_name: []const u8,
+        command: Command,
+    ) Allocator.Error!Config {
+        const owned_db_path = try allocator.dupe(u8, db_path);
+        errdefer allocator.free(owned_db_path);
+        const owned_migrations_path = try allocator.dupe(u8, migrations_path);
+        errdefer allocator.free(owned_migrations_path);
+        const owned_table_name = try allocator.dupe(u8, table_name);
+
+        return .{
+            .allocator = allocator,
+            .db_path = owned_db_path,
+            .migrations_path = owned_migrations_path,
+            .table_name = owned_table_name,
+            .command = command,
+        };
+    }
+
+    fn deinit(self: *Config) void {
+        self.allocator.free(self.db_path);
+        self.allocator.free(self.migrations_path);
+        self.allocator.free(self.table_name);
+    }
 };
 
 const Migration = struct {
@@ -224,12 +253,13 @@ fn parseArgs(allocator: Allocator) !ParseResult {
         return .err;
     }
 
-    return .{ .config = Config{
-        .db_path = db_path.?,
-        .migrations_path = migrations_path.?,
-        .table_name = table_name,
-        .command = command.?,
-    } };
+    return .{ .config = try Config.initOwned(
+        allocator,
+        db_path.?,
+        migrations_path.?,
+        table_name,
+        command.?,
+    ) };
 }
 
 // ============================================================================
@@ -731,24 +761,21 @@ pub fn main() !void {
     // Use page allocator for CLI tool - memory is reclaimed on process exit
     const allocator = std.heap.page_allocator;
 
-    const config = switch (try parseArgs(allocator)) {
+    var config = switch (try parseArgs(allocator)) {
         .config => |c| c,
         .help => return, // Exit 0 for help
         .err => std.process.exit(1),
     };
+    defer config.deinit();
 
     switch (config.command) {
-        .up => runUp(allocator, config) catch |err| {
-            if (@TypeOf(err) == MigrationError) {
-                std.process.exit(1);
-            }
-            return err;
+        .up => runUp(allocator, config) catch {
+            config.deinit();
+            std.process.exit(1);
         },
-        .status => runStatus(allocator, config) catch |err| {
-            if (@TypeOf(err) == MigrationError) {
-                std.process.exit(1);
-            }
-            return err;
+        .status => runStatus(allocator, config) catch {
+            config.deinit();
+            std.process.exit(1);
         },
     }
 }
@@ -782,4 +809,27 @@ test "table name validation rejects unsafe identifiers" {
     try std.testing.expect(!isValidTableName("schema-migrations"));
     try std.testing.expect(!isValidTableName("migrations; DROP TABLE users"));
     try std.testing.expect(!isValidTableName("migratiöns"));
+}
+
+test "Config owns argument storage" {
+    var db_source = [_]u8{ 'd', 'a', 't', 'a', '.', 'd', 'b' };
+    var migrations_source = [_]u8{ 'm', 'i', 'g', 'r', 'a', 't', 'i', 'o', 'n', 's' };
+    var table_source = [_]u8{ 'c', 'u', 's', 't', 'o', 'm' };
+
+    var config = try Config.initOwned(
+        std.testing.allocator,
+        &db_source,
+        &migrations_source,
+        &table_source,
+        .up,
+    );
+    defer config.deinit();
+
+    @memset(&db_source, 'x');
+    @memset(&migrations_source, 'x');
+    @memset(&table_source, 'x');
+
+    try std.testing.expectEqualStrings("data.db", config.db_path);
+    try std.testing.expectEqualStrings("migrations", config.migrations_path);
+    try std.testing.expectEqualStrings("custom", config.table_name);
 }
