@@ -1293,6 +1293,46 @@ test "e2e: very long migration filename" {
     try std.testing.expectEqual(@as(?u8, 0), result.exitCode());
 }
 
+test "e2e: migration larger than 64 KiB succeeds" {
+    const allocator = std.testing.allocator;
+    var tmp = try TempDir.init(allocator);
+    defer tmp.cleanup();
+
+    const padding = try allocator.alloc(u8, 70 * 1024);
+    defer allocator.free(padding);
+    @memset(padding, 'x');
+    const sql = try std.fmt.allocPrint(
+        allocator,
+        "CREATE TABLE large_migration_before (id INTEGER);\n/* {s} */\nCREATE TABLE large_migration_after (id INTEGER);",
+        .{padding},
+    );
+    defer allocator.free(sql);
+    try tmp.writeMigration("001_large.sql", sql);
+
+    var result = try runLitem8(allocator, &.{
+        "up",
+        "--db",
+        tmp.db_path,
+        "--migrations",
+        tmp.migrations_path,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(?u8, 0), result.exitCode());
+    var db = try openDb(allocator, tmp.db_path);
+    defer db.deinit();
+    try std.testing.expect(try tableExists(allocator, &db, "large_migration_before"));
+    try std.testing.expect(try tableExists(allocator, &db, "large_migration_after"));
+
+    const migrations = try getRecordedMigrations(allocator, &db, "schema_migrations");
+    defer {
+        for (migrations) |migration| allocator.free(migration);
+        allocator.free(migrations);
+    }
+    try std.testing.expectEqual(@as(usize, 1), migrations.len);
+    try std.testing.expectEqualStrings("001_large.sql", migrations[0]);
+}
+
 test "e2e: migration number with many leading zeros" {
     const allocator = std.testing.allocator;
     var tmp = try TempDir.init(allocator);

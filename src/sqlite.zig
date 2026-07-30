@@ -97,16 +97,12 @@ pub const Db = struct {
             return Error.InvalidSql;
         }
 
-        // sqlite3_exec requires null-terminated string
-        var buf: [64 * 1024]u8 = undefined;
-        if (sql.len >= buf.len) {
-            return Error.OutOfMemory;
-        }
-        @memcpy(buf[0..sql.len], sql);
-        buf[sql.len] = 0;
+        // sqlite3_exec requires a null-terminated string.
+        const sql_z = std.heap.page_allocator.dupeZ(u8, sql) catch return Error.OutOfMemory;
+        defer std.heap.page_allocator.free(sql_z);
 
         var err_msg: [*c]u8 = null;
-        const rc = c.sqlite3_exec(self.handle, &buf, null, null, &err_msg);
+        const rc = c.sqlite3_exec(self.handle, sql_z.ptr, null, null, &err_msg);
         if (err_msg) |msg| {
             c.sqlite3_free(msg);
         }
@@ -328,14 +324,21 @@ test "execMulti runs multiple statements" {
     try std.testing.expectEqual(@as(i32, 2), stmt_b.columnInt(0));
 }
 
-test "execMulti with SQL too large returns error" {
+test "execMulti supports SQL larger than 64 KiB" {
     var db = try Db.open(":memory:", .{});
     defer db.deinit();
 
-    // Create SQL larger than 64KB buffer
-    const large_sql = "SELECT 1;" ** 10000;
-    const result = db.execMulti(large_sql);
-    try std.testing.expectError(Error.OutOfMemory, result);
+    const padding = "x" ** (70 * 1024);
+    const large_sql = "CREATE TABLE large_sql_before (id INTEGER); /* " ++ padding ++
+        " */ CREATE TABLE large_sql_after (id INTEGER);";
+    try db.execMulti(large_sql);
+
+    var stmt = try db.prepare(
+        "SELECT COUNT(*) FROM sqlite_master WHERE name IN ('large_sql_before', 'large_sql_after')",
+    );
+    defer stmt.deinit();
+    try std.testing.expect(try stmt.step());
+    try std.testing.expectEqual(@as(i32, 2), stmt.columnInt(0));
 }
 
 test "execMigration denies transaction control and restores the authorizer" {
